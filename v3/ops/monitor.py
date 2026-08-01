@@ -743,6 +743,38 @@ def collect(restart_ok: bool) -> dict:
         if restart_ok and (dead or (hard and streak >= 2)):
             # Restart between windows so the process is healthy before the next
             # MinerCommit1. This does NOT recover the round already missed.
+            # Repair the narrowest thing that is broken.
+            #
+            # The two processes fail independently, and the commit worker is
+            # the one that earns. If only the trainer is bad, respawn only the
+            # trainer: on 2026-08-01 08:27 a whole-miner restart killed uid
+            # 250's commit worker four seconds before MinerCommit2, discarding
+            # a checkpoint it had already uploaded.
+            phase = payload.get("phase")
+            in_commit_window = phase in ("MinerCommit1", "MinerCommit2")
+
+            if st.commit_alive and not st.train_alive:
+                st.notes.append("respawning train window only (commit worker healthy)")
+                try:
+                    subprocess.run(
+                        [str(OPS_ROOT / "launch.sh"), "respawn", str(uid), "train"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.notes.append(f"respawn failed: {exc}")
+                payload["miners"][str(uid)] = asdict(st)
+                continue
+
+            # Whole-miner restart. Only force past phase_guard when there is no
+            # submission left to protect -- i.e. the commit worker itself is
+            # gone. A hung trainer with a live commit worker can still submit
+            # the last good checkpoint, which is exactly what uid 250 was doing.
+            if in_commit_window and st.commit_alive:
+                st.notes.append(f"deferring restart: phase={phase}, commit worker alive "
+                                f"-- restarting now would discard this cycle's submission")
+                payload["miners"][str(uid)] = asdict(st)
+                continue
+
             st.notes.append("restarting via launch.sh")
             try:
                 # `restart`, not `start`. start_one runs `tmux new-session`,
@@ -760,7 +792,10 @@ def collect(restart_ok: bool) -> dict:
                 subprocess.run(
                     [str(OPS_ROOT / "launch.sh"), "restart", str(uid)],
                     capture_output=True, text=True, timeout=300,
-                    env={**os.environ, "FORCE_RESTART": "1"},
+                    # Force only when the commit worker is already gone, so
+                    # there is no in-flight submission for phase_guard to
+                    # protect. Otherwise let the guard refuse and try next poll.
+                    env={**os.environ, "FORCE_RESTART": "1" if not st.commit_alive else "0"},
                 )
             except Exception as exc:  # noqa: BLE001
                 st.notes.append(f"restart failed: {exc}")

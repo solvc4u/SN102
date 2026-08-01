@@ -260,11 +260,31 @@ cmd_status() {
     --format=csv,noheader 2>/dev/null || true
 }
 
+# Respawn ONE window, leaving the other alone.
+#
+# A miner is two independent processes and they fail independently. On
+# 2026-08-01 08:27 uid 250's trainer was wedged while its commit worker was
+# healthy and four seconds from submitting an already-uploaded checkpoint --
+# a whole-miner restart killed the submission to fix the trainer.
+#
+# `tmux respawn-window` reuses the window's original command, so the full env
+# (CUDA_VISIBLE_DEVICES, CONNITO_DATA_RANK, tokens) is preserved without
+# rebuilding it here and risking drift from start_one.
+cmd_respawn() {
+  local uid="${1:?usage: launch.sh respawn <uid> [train|commit]}" win="${2:-train}"
+  case "$win" in train|commit) ;; *) echo "window must be train|commit" >&2; return 1 ;; esac
+  local session="sn102-$uid"
+  tmux has-session -t "$session" 2>/dev/null || { echo "no session $session -- use start" >&2; return 1; }
+  tmux respawn-window -k -t "$session:$win" || return 1
+  echo "respawned $session:$win (other window untouched)"
+}
+
 case "${1:-}" in
   start)   cmd_start "${2:-all}" ;;
   restart) cmd_restart "${2:-all}" ;;
+  respawn) cmd_respawn "${2:-}" "${3:-train}" ;;
   stop)    cmd_stop "${2:-all}" ;;
   status) cmd_status ;;
   logs)   tail -f "$LOG_DIR/uid${2:?usage: launch.sh logs <uid> [train|commit]}-${3:-train}.log" ;;
-  *) echo "usage: $0 {start [uid]|restart [uid]|stop|status|logs <uid>}" >&2; exit 1 ;;
+  *) echo "usage: $0 {start [uid]|restart [uid]|respawn <uid> [train|commit]|stop|status|logs <uid>}" >&2; exit 1 ;;
 esac
