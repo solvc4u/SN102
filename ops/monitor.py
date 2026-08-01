@@ -743,6 +743,33 @@ def collect(restart_ok: bool) -> dict:
         if restart_ok and (dead or (hard and streak >= 2)):
             # Restart between windows so the process is healthy before the next
             # MinerCommit1. This does NOT recover the round already missed.
+            # ---- what may be repaired automatically -----------------------
+            # Deliberately narrow, because every round lost so far was lost to
+            # a restart rather than to a fault:
+            #
+            #   only when a process is FULLY DEAD. A hung process still holds a
+            #   live commit worker that can submit the last good checkpoint --
+            #   uid 250 was four seconds from MinerCommit2 when a restart
+            #   issued for its wedged trainer discarded the round (08:27).
+            #
+            #   never during MinerCommit1/MinerCommit2, whatever the state.
+            #
+            # Anything else is reported and left alone for a human. A hang that
+            # persists is a notification, not an emergency; a missed round is
+            # cheaper than a discarded submission.
+            phase_now = payload.get("phase")
+            fully_dead = not st.train_alive or not st.commit_alive
+            if phase_now in ("MinerCommit1", "MinerCommit2"):
+                st.notes.append(f"auto-repair suppressed: phase={phase_now} "
+                                f"-- never restart inside a commit window")
+                payload["miners"][str(uid)] = asdict(st)
+                continue
+            if not fully_dead:
+                st.notes.append("auto-repair suppressed: process alive (hung, not dead) "
+                                "-- reporting only, restart needs a human")
+                payload["miners"][str(uid)] = asdict(st)
+                continue
+
             # Repair the narrowest thing that is broken.
             #
             # The two processes fail independently, and the commit worker is
@@ -759,6 +786,7 @@ def collect(restart_ok: bool) -> dict:
                     subprocess.run(
                         [str(OPS_ROOT / "launch.sh"), "respawn", str(uid), "train"],
                         capture_output=True, text=True, timeout=120,
+                        start_new_session=True,
                     )
                 except Exception as exc:  # noqa: BLE001
                     st.notes.append(f"respawn failed: {exc}")
@@ -792,6 +820,11 @@ def collect(restart_ok: bool) -> dict:
                 subprocess.run(
                     [str(OPS_ROOT / "launch.sh"), "restart", str(uid)],
                     capture_output=True, text=True, timeout=300,
+                    # Own session, so killing the monitor cannot kill launch.sh
+                    # between cmd_stop and cmd_start. On 2026-08-01 08:46 the
+                    # monitor was killed during that window and left uid 250
+                    # stopped for three hours across ~4 cycles.
+                    start_new_session=True,
                     # Force only when the commit worker is already gone, so
                     # there is no in-flight submission for phase_guard to
                     # protect. Otherwise let the guard refuse and try next poll.
