@@ -745,9 +745,22 @@ def collect(restart_ok: bool) -> dict:
             # MinerCommit1. This does NOT recover the round already missed.
             st.notes.append("restarting via launch.sh")
             try:
+                # `restart`, not `start`. start_one runs `tmux new-session`,
+                # which fails when the session already exists -- and the error
+                # is swallowed by `|| true`. So `start` is a silent no-op
+                # against the case we most need to repair: a HUNG miner, where
+                # the tmux session and pid are alive but the process has
+                # stopped making progress. uid 250 sat wedged for 54 minutes on
+                # 2026-08-01 08:25 with the monitor "restarting" it every poll.
+                # Only `restart` tears the session down first.
+                #
+                # FORCE_RESTART=1 because cmd_restart re-runs phase_guard,
+                # which refuses during MinerCommit/early-Train -- exactly when a
+                # wedged miner is most expensive to leave alone.
                 subprocess.run(
-                    [str(OPS_ROOT / "launch.sh"), "start", str(uid)],
-                    capture_output=True, text=True, timeout=180,
+                    [str(OPS_ROOT / "launch.sh"), "restart", str(uid)],
+                    capture_output=True, text=True, timeout=300,
+                    env={**os.environ, "FORCE_RESTART": "1"},
                 )
             except Exception as exc:  # noqa: BLE001
                 st.notes.append(f"restart failed: {exc}")
