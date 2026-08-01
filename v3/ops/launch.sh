@@ -162,6 +162,20 @@ start_one() {
     ${FORCE_MIN_FRAC:+"CONNITO_FORCE_MIN_FRAC=$FORCE_MIN_FRAC"}
     ${CKPT_SELECT:+"CONNITO_CKPT_SELECT=$CKPT_SELECT"}
     "TUNER_DB=$TUNER_DB"
+    # Per-uid LR override if ops/lr_override_<uid>.json exists, else the shared
+    # file. autolr re-reads whichever path this points at on every cycle
+    # boundary, so the VALUE stays hot-swappable without a restart -- only
+    # choosing a different FILE needs one, since the env is fixed at exec.
+    #
+    # Divergent LR per miner is not exotic here: the bandit itself ran 4e-4 on
+    # 178 and 2e-5 on 250 at cycle 16640, before a shared override flattened
+    # both to one value.
+    "CONNITO_LR_OVERRIDE=$(
+        if [[ -f "$OPS_ROOT/lr_override_$uid.json" ]]; then
+            echo "$OPS_ROOT/lr_override_$uid.json"
+        else
+            echo "$OPS_ROOT/lr_override.json"
+        fi)"
     "PYTHONPATH=$CONNITO_ROOT:/root/SN102"
     # 31.4GiB cards vs the 47GB A6000 this config is sized for. The first OOM
     # showed 2.16GiB "reserved but unallocated" -- pure fragmentation.
