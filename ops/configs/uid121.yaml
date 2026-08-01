@@ -37,7 +37,7 @@ ckpt:
   checkpoint_path: /data/checkpoints/miner/template_coldkey_name/template_hotkey_name/foundation/exp_legal
   checkpoint_interval: 100
   full_validation_interval: 20
-  checkpoint_topk: 4
+  checkpoint_topk: 2
   validator_checkpoint_path: /data/checkpoints/miner/validator_checkpoint
   download_concurrency: 1
   use_pretrained_only: false

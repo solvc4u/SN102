@@ -99,10 +99,20 @@ signal has no false-positive mode.
 
 ## 6. Open items
 
-- [ ] **Disk.** 97 % full. Each miner writes an **11 GB** checkpoint every ~7 min.
-      v3 checkpoints hold ~78 GB, of which only `model_expgroup_3.safetensors`
-      (3.34 GB × 2) is the actual model — the rest is `inner_optimizer.pt`, useful only
-      for resuming group-3 training, which is now impossible. Awaiting a decision.
+- [x] **Disk — caused a real outage, now guarded.** At 97 % full both miners crashed
+      mid-save on 2026-08-01 06:11 / 06:16:
+      `RuntimeError: [enforce fail at inline_container.cc:668] unexpected pos
+      685328448 vs 685328336` — a truncated `torch.save` of `inner_optimizer.pt`.
+      MinerCommit1 was due 06:39:47; both processes were restarting through it, so
+      **cycle 16693 was missed entirely** ("no chain commit registered").
+      Reclaimed ~46 GB from *re-fetchable* sources only — superseded
+      `validator_checkpoint` downloads and older `exp_nemotron_c4` working
+      checkpoints. **`exp_legal` was not touched** and is kept indefinitely.
+      `checkpoint_topk` lowered 4 → 2, and `monitor.prune_checkpoints()` now enforces
+      the same bound from outside the process, so it applies without restarting
+      training. The guard is restricted to `PRUNABLE_GROUPS = ("exp_nemotron_c4",)`
+      and to `ACTIVE_UIDS`, and orders by `inneropt_N` rather than mtime — a
+      crash-truncated checkpoint can carry a newer mtime than the last good one.
 - [ ] **Local corpus.** `ops/fetch_corpus.py --expert-group exp_nemotron_c4` was paused at
       8.7 GB to stop disk bleed. Miners currently stream from HF (the recommended path).
       Resume only after disk is resolved, and only with windowed tokenisation preserved.

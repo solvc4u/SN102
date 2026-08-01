@@ -37,7 +37,7 @@ ckpt:
   checkpoint_path: checkpoints/miner/Apollo/miner5/uid250/exp_nemotron_c4
   checkpoint_interval: 100
   full_validation_interval: 20
-  checkpoint_topk: 4
+  checkpoint_topk: 2
   validator_checkpoint_path: checkpoints/miner/validator_checkpoint
   download_concurrency: 1
   use_pretrained_only: false
