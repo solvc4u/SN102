@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""
+SN102 miner monitor.
+
+    python -m ops.monitor                 # foreground, 60s poll
+    python -m ops.monitor --interval 30
+    python -m ops.monitor --once          # single snapshot, then exit
+    python -m ops.monitor --no-restart    # observe only, never restart anything
+
+Watches every UID and answers the only questions that matter:
+  * is the process alive?
+  * did the HF upload actually land this cycle?
+  * did a validator score us, and what was the val_loss?
+  * are we on track for the Weight Group 1 recency gate?
+
+Outputs
+-------
+  logs/status.log          human-readable table, appended each poll
+  logs/status.jsonl        one JSON object per poll (machine readable)
+  logs/uid<N>-status.log   per-UID history, one line per poll
+
+--------------------------------------------------------------------------------
+On "retry the commit if it didn't happen"
+--------------------------------------------------------------------------------
+Worth being precise, because the obvious version of this does nothing.
+
+A submission is only visible to validators if it lands **inside its phase
+window**. `build_chain_checkpoints_from_previous_phase` reads the signed-hash
+commit at `MinerCommit1_end + 1` and the hash commit at `MinerCommit2_end + 1`.
+Re-uploading at any other time is invisible for that round -- the bytes go to
+HF, and no validator ever looks.
+
+So there are exactly two useful automated responses, and this monitor does both:
+
+  1. **In-window retry** -- already handled upstream in ops/commit.py, which
+     retries the HF upload with jittered backoff inside a bounded budget. That
+     is the only place a retry can still make the round.
+
+  2. **Between-window repair** -- if a cycle closed with no new HF revision, the
+     round is already lost; the correct action is to make sure the *next* one
+     is not. This monitor restarts a dead or wedged commit process so it is
+     healthy before the next MinerCommit1 opens, and counts the miss against
+     the 3-of-5 recency budget so the loss is visible rather than silent.
+
+A third case the monitor cannot fix and will say so loudly: the upload
+succeeded but the chain commit did not. That leaves HF and chain disagreeing,
+and only the next cycle clears it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+# v3, NOT v1. v1 serves val_loss from a Prometheus gauge that is not cleared at
+# round rollover, so most miners show a stale number most of the time with no
+# way to tell which. v3 is "sourced from the last completed cycle's snapshot"
+# and reports freshness explicitly: data_status, evaluated_this_round,
+# committed_this_cycle, score_latest_age_blocks, plus a per-miner loss_trend
+# history and the cohort group that actually determines whether weight is
+# earned. Reading v1 all day produced several wrong conclusions -- comparing our
+# current loss against leaders' stale values from an easier baseline.
+DASHBOARD_API = "https://dashboard-api-v2.connito.ai/api/v3/leaderboard"
+import re
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+LOG_DIR = Path(os.environ.get("LOG_DIR", "/root/SN102/logs"))
+OPS_ROOT = Path(os.environ.get("OPS_ROOT", "/root/SN102/ops"))
+
+# uid -> (gpu, hf repo env var). MUST match the MINERS table in launch.sh --
+# a stale mapping here reports another miner's VRAM against the wrong uid.
+MINERS = {
+    250: (0, "HF_REPO_UID250"),
+    178: (1, "HF_REPO_UID178"),
+    121: (2, "HF_REPO_UID121"),
+}
+
+# Only these are supposed to be running. A uid outside this set is held back by
+# operator decision (121 is a candidate pending 250/178 scores), so the monitor
+# must neither restart it nor report it as broken. ACTIVE_UIDS is shared with
+# launch.sh via the environment so the two cannot drift apart.
+ACTIVE_UIDS = {
+    int(x) for x in os.environ.get("ACTIVE_UIDS", "250 178").replace(",", " ").split()
+}
+
+# Weight Group 1 needs scores under >=3 distinct round_ids within the last
+# 5*cycle_length blocks (evaluator.py:497-500). Two misses inside a 5-cycle
+# window is the point of no return for the 98% share.
+G1_WINDOW_CYCLES = 5
+G1_REQUIRED_SCORES = 3
+
+
+@dataclass
+class UidState:
+    uid: int
+    gpu: int
+    repo: str | None = None
+    train_alive: bool = False
+    commit_alive: bool = False
+    train_log_age: float | None = None
+    commit_log_age: float | None = None
+    last_commit_age: float | None = None
+    alerts: list = field(default_factory=list)   # (severity, message)
+    gpu_mem_mib: int = 0
+    val_loss: float | None = None
+    baseline_loss: float | None = None
+    delta_loss: float | None = None
+    score: float | None = None
+    chain_weight: float | None = None
+    chain_hf_repo: str | None = None
+    chain_hf_revision: str | None = None
+    hf_last_revision: str | None = None
+    hf_last_commit_utc: str | None = None
+    hf_age_minutes: float | None = None
+    in_assignment: bool | None = None
+    data_status: str | None = None
+    cohort_group: str | None = None
+    evaluated_this_round: bool | None = None
+    committed_this_cycle: bool | None = None
+    score_age_blocks: int | None = None
+    assigned_slots: list = field(default_factory=list)
+    loss_trend: list = field(default_factory=list)
+    evaluated_by: list = field(default_factory=list)
+    val_loss_is_stale: bool = False
+    val_loss_first_round: int | None = None
+    rounds_since_fresh_eval: int | None = None
+    notes: list = field(default_factory=list)
+
+
+def _get_json(url: str, timeout: int = 25):
+    req = urllib.request.Request(url, headers={"User-Agent": "sn102-monitor"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+# A miner is "alive" only if it is still WRITING. Twice now a process died or
+# hung while its tmux window survived, and the monitor reported it up:
+#   - one session where the train window died and the commit window did not
+#   - 3.4h where all four processes hung inside setup_chain_worker on a 429
+#     websocket handshake, GPUs at 16MiB, tmux windows intact
+# Process topology is not evidence of progress. Log age is.
+LOG_STALE_SEC = int(os.environ.get("CONNITO_LOG_STALE_SEC", "900"))      # 15 min
+LOG_DEAD_SEC = int(os.environ.get("CONNITO_LOG_DEAD_SEC", "1800"))       # 30 min -> restart
+
+
+# A cycle is ~105 min. Anything past this means a MinerCommit2 window came and
+# went without us committing -- a missed round, which costs one of the 3-of-5
+# recency slots that Weight Group 1 requires.
+#
+# Seen 2026-08-01: uid 250 had 11 clean 104.8-min intervals, then a 209.5-min
+# gap. The scheduler reached Distribute, set its MinerCommit1 target, took two
+# HTTP 429s from cycle-api seconds later, and by the next heartbeat had looped
+# back to waiting for the FOLLOWING Distribute -- skipping the commit entirely.
+# Both processes stayed alive and both logs kept moving, so liveness checks saw
+# nothing wrong. Cadence is the only signal that catches this.
+COMMIT_LATE_SEC = int(os.environ.get("CONNITO_COMMIT_LATE_SEC", "7800"))    # 130 min
+COMMIT_MISSED_SEC = int(os.environ.get("CONNITO_COMMIT_MISSED_SEC", "9600"))   # 160 min
+# 160 min, not 210. A cycle is ~105 min, so one missed window lands near 210 --
+# setting the CRIT threshold AT 210 meant the real 209.5-min miss fell just
+# under it and only raised a WARN. 160 min is comfortably past one late cycle
+# but well short of two, so a single skipped commit trips it.
+
+
+def last_commit_age_seconds(uid: int) -> float | None:
+    """Seconds since this uid's last successful MinerCommit2."""
+    import re as _re, datetime as _dt
+    f = LOG_DIR / f"uid{uid}-commit.log"
+    if not f.is_file():
+        return None
+    last = None
+    try:
+        with f.open("rb") as fh:
+            fh.seek(max(0, f.stat().st_size - 400_000))
+            for raw in fh.read().decode("utf-8", "ignore").splitlines():
+                line = ANSI_RE.sub("", raw)
+                if "MinerCommit2> committing" in line:
+                    m = _re.match(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+                    if m:
+                        last = m.group(1)
+    except Exception:  # noqa: BLE001
+        return None
+    if last is None:
+        return None
+    try:
+        t = _dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - t).total_seconds()
+    except ValueError:
+        return None
+
+
+def _proc_age_seconds(uid: int) -> float | None:
+    """Seconds since this uid's trainer process started."""
+    import subprocess as _sp
+    try:
+        out = _sp.run(["pgrep", "-f", f"ops.autolr --uid {uid}"],
+                      capture_output=True, text=True, timeout=10)
+        pid = out.stdout.split()[0] if out.stdout.strip() else None
+        if not pid:
+            return None
+        with open(f"/proc/{pid}/stat") as fh:
+            starttime = float(fh.read().split()[21])
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
+        return uptime - starttime / os.sysconf("SC_CLK_TCK")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def log_age_seconds(uid: int, which: str) -> float | None:
+    """Seconds since the miner last wrote a line. None if the file is missing."""
+    f = LOG_DIR / f"uid{uid}-{which}.log"
+    try:
+        return max(0.0, time.time() - f.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+
+
+def tmux_alive(session: str, window: str) -> bool:
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-t", f"{session}:{window}", "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.returncode == 0 and bool(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def gpu_memory() -> dict[int, int]:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+        )
+        mem = {}
+        for line in out.stdout.strip().splitlines():
+            idx, used = (p.strip() for p in line.split(","))
+            mem[int(idx)] = int(used)
+        return mem
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def hf_last_commit(repo: str, token: str | None) -> tuple[str | None, str | None]:
+    """Latest commit sha + ISO timestamp on the repo's main branch."""
+    try:
+        from huggingface_hub import HfApi
+
+        commits = HfApi(token=token).list_repo_commits(repo_id=repo, revision="main")
+        if not commits:
+            return None, None
+        c = commits[0]
+        return c.commit_id[:7], c.created_at.isoformat()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"ERROR: {type(exc).__name__}: {str(exc)[:120]}"
+
+
+ALERTS_LOG = LOG_DIR / "alerts.jsonl"
+ALERT_STATE = LOG_DIR / "alert_state.json"
+# Re-notify a still-firing alert at most this often, so a persistent condition
+# does not spam but also does not go silent.
+ALERT_REPEAT_SEC = int(os.environ.get("CONNITO_ALERT_REPEAT_SEC", "3600"))
+
+
+def emit_alerts(payload: dict) -> None:
+    """Append new/changed alerts and surface CRIT ones loudly.
+
+    Writes logs/alerts.jsonl (machine readable) and prints a banner. A separate
+    notify hook can tail that file; the monitor deliberately does not depend on
+    any external notification service so it cannot fail because of one.
+    """
+    try:
+        state = json.loads(ALERT_STATE.read_text())
+    except Exception:  # noqa: BLE001
+        state = {}
+    now = time.time()
+    fresh = []
+    for uid, st in payload.get("miners", {}).items():
+        for sev, msg in st.get("alerts", []):
+            key = f"{uid}:{sev}:{msg[:60]}"
+            last = state.get(key, 0)
+            if now - last < ALERT_REPEAT_SEC:
+                continue
+            state[key] = now
+            fresh.append({"ts": payload["ts"], "uid": int(uid), "severity": sev, "message": msg})
+    if fresh:
+        with ALERTS_LOG.open("a") as fh:
+            for a in fresh:
+                fh.write(json.dumps(a) + "\n")
+        crit = [a for a in fresh if a["severity"] == "CRIT"]
+        print("\n" + "!" * 72)
+        for a in fresh:
+            print(f"!! {a['severity']:<4} uid {a['uid']}: {a['message']}")
+        if crit:
+            print(f"!! {len(crit)} CRITICAL -- miner(s) not producing; auto-restart attempted")
+        print("!" * 72 + "\n", flush=True)
+    try:
+        ALERT_STATE.write_text(json.dumps(state))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+GAUGE_STATE = LOG_DIR / "gauge_state.json"
+
+
+def _load_gauge_state() -> dict:
+    try:
+        return json.loads(GAUGE_STATE.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_gauge_state(state: dict) -> None:
+    try:
+        GAUGE_STATE.write_text(json.dumps(state))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _classify_gauge(state: dict, uid: int, val_loss, round_id) -> tuple[bool, int | None, int | None]:
+    """Decide whether this uid's val_loss is a fresh measurement or a stale gauge.
+
+    The dashboard serves val_loss from a Prometheus gauge that is NOT cleared at
+    round rollover (documented in docs/miner-faq/scoring.md). A round scores only
+    ~49 of a ~174-miner roster, so most uids show their previous measurement most
+    of the time -- 174 miners report a val_loss while 49 were actually scored.
+
+    The eval seed is derived from chain state and changes every round, so even
+    byte-identical weights produce a different loss. A val_loss that is identical
+    to full float precision across two different round_ids therefore means no new
+    measurement was taken -- not that the result reproduced.
+
+    Returns (is_stale, first_round_seen, rounds_since_fresh).
+    """
+    if val_loss is None or round_id is None:
+        return False, None, None
+    key = str(uid)
+    prev = state.get(key)
+    if prev is None or repr(prev.get("val_loss")) != repr(val_loss):
+        state[key] = {"val_loss": val_loss, "first_round": round_id, "rounds": 0}
+        return False, round_id, 0
+    if round_id != prev.get("last_round"):
+        prev["rounds"] = int(prev.get("rounds", 0)) + (1 if prev.get("last_round") is not None else 0)
+    prev["last_round"] = round_id
+    state[key] = prev
+    first = prev.get("first_round")
+    stale = first is not None and round_id != first
+    return stale, first, prev.get("rounds")
+
+
+def collect(restart_ok: bool) -> dict:
+    payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "miners": {}}
+
+    try:
+        board = _get_json(DASHBOARD_API)["data"]
+    except Exception as exc:  # noqa: BLE001
+        board = None
+        payload["dashboard_error"] = f"{type(exc).__name__}: {str(exc)[:150]}"
+
+    if board:
+        payload["phase"] = board.get("phase", {}).get("name")
+        payload["blocks_remaining"] = board.get("phase", {}).get("blocks_remaining")
+        payload["cycle_index"] = board.get("phase", {}).get("cycle_index")
+        rnd = board.get("round", {}) or {}
+        payload["baseline_loss"] = rnd.get("baseline_loss")
+        payload["round_stats"] = rnd.get("stats")
+        by_uid = {int(m["uid"]): m for m in board.get("leaderboard", [])}
+
+        # Rank the field so we can see the gap to the top, which is the number
+        # that actually decides whether we place top-3 this round.
+        scored = sorted(
+            (m for m in board.get("leaderboard", []) if m.get("val_loss") is not None),
+            key=lambda m: m["val_loss"],
+        )
+        payload["field_size"] = len(scored)
+        payload["best_val_loss"] = scored[0]["val_loss"] if scored else None
+        payload["rank3_val_loss"] = scored[2]["val_loss"] if len(scored) > 2 else None
+    else:
+        by_uid = {}
+
+    mem = gpu_memory()
+    now = time.time()
+    gauge_state = _load_gauge_state()
+    round_id = (board or {}).get("round", {}).get("id") if board else None
+
+    for uid, (gpu, repo_var) in MINERS.items():
+        if uid not in ACTIVE_UIDS:
+            continue
+        st = UidState(uid=uid, gpu=gpu, repo=os.environ.get(repo_var))
+        session = f"sn102-{uid}"
+        st.last_commit_age = last_commit_age_seconds(uid)
+        st.train_log_age = log_age_seconds(uid, "train")
+        st.commit_log_age = log_age_seconds(uid, "commit")
+        # tmux window present AND log advancing recently
+        st.train_alive = tmux_alive(session, "train") and (st.train_log_age or 1e9) < LOG_DEAD_SEC
+        st.commit_alive = tmux_alive(session, "commit") and (st.commit_log_age or 1e9) < LOG_DEAD_SEC
+        st.gpu_mem_mib = mem.get(gpu, 0)
+
+        m = by_uid.get(uid)
+        if m:
+            st.data_status = m.get("data_status")
+            st.cohort_group = m.get("cohort_group")
+            st.evaluated_this_round = m.get("evaluated_this_round")
+            st.committed_this_cycle = m.get("committed_this_cycle")
+            st.assigned_slots = m.get("assigned_validator_slots") or []
+            st.loss_trend = [v for v in (m.get("loss_trend") or []) if v is not None][-6:]
+            vms = m.get("validator_metrics") or []
+            if vms:
+                st.score_age_blocks = vms[0].get("score_latest_age_blocks")
+                if m.get("val_loss") is None:
+                    st.val_loss = vms[0].get("val_loss")
+            st.val_loss = m.get("val_loss")
+            st.delta_loss = m.get("delta_loss")
+            st.score = m.get("score")
+            st.chain_weight = m.get("chain_weight_stake_weighted")
+            st.chain_hf_repo = m.get("hf_repo_id")
+            st.chain_hf_revision = m.get("hf_revision")
+            st.in_assignment = m.get("in_assignment")
+            st.evaluated_by = m.get("evaluated_by_validator_labels") or []
+            st.baseline_loss = payload.get("baseline_loss")
+
+        if st.repo:
+            token = os.environ.get(f"HF_TOKEN_UID{uid}") or os.environ.get("HF_TOKEN")
+            sha, ts = hf_last_commit(st.repo, token)
+            st.hf_last_revision = sha
+            st.hf_last_commit_utc = ts
+            if ts and not ts.startswith("ERROR"):
+                try:
+                    from datetime import datetime
+
+                    dt = datetime.fromisoformat(ts)
+                    st.hf_age_minutes = round((now - dt.timestamp()) / 60.0, 1)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # ---- diagnosis -----------------------------------------------------
+        if not st.train_alive:
+            st.notes.append("TRAIN PROCESS DOWN")
+        if not st.commit_alive:
+            st.notes.append("COMMIT PROCESS DOWN -- cannot submit")
+        if st.train_alive and st.gpu_mem_mib < 500:
+            st.notes.append("train alive but GPU nearly idle (still loading, or wedged)")
+
+        # A cycle is ~500 blocks * 12s ~= 100 min. No HF commit in >2 cycles
+        # means submissions are not landing at all.
+        if st.hf_age_minutes is not None and st.hf_age_minutes > 210:
+            st.notes.append(f"NO HF UPLOAD IN {st.hf_age_minutes:.0f} MIN (>2 cycles) -- missing rounds")
+
+        # HF and chain disagreeing means the upload landed but the chain commit
+        # did not carry the coords (or vice versa). Only the next cycle clears it.
+        if st.chain_hf_revision and st.hf_last_revision and \
+                not st.chain_hf_revision.startswith(st.hf_last_revision[:7]) and \
+                not st.hf_last_revision.startswith(st.chain_hf_revision[:7]):
+            st.notes.append(
+                f"chain revision {st.chain_hf_revision} != HF head {st.hf_last_revision} "
+                f"(commit/upload out of sync)"
+            )
+
+        if st.chain_hf_repo is None and st.train_alive:
+            st.notes.append("no chain commit registered -- not evaluated this round")
+
+        # v3 states freshness directly; keep the inferred check only as a
+        # cross-check for when a field is missing.
+        if st.evaluated_this_round is False:
+            st.val_loss_is_stale = True
+        else:
+            st.val_loss_is_stale, st.val_loss_first_round, st.rounds_since_fresh_eval = _classify_gauge(
+                gauge_state, uid, st.val_loss, round_id
+            )
+
+        # The blocker is cohort membership, not val_loss. Chain weight goes to
+        # Groups A and B (see docs/miner-validation-group-promotion.md); "tail"
+        # and "none" earn nothing regardless of how good the loss is.
+        if st.cohort_group in (None, "none", "tail"):
+            st.notes.append(
+                f"COHORT={st.cohort_group} -- outside A/B, earns no weight. "
+                f"C->B needs consistent scoring to build local history."
+            )
+        if st.committed_this_cycle is False:
+            st.notes.append("DID NOT COMMIT THIS CYCLE -- round missed, counts against 3-of-5 recency")
+        if st.score_age_blocks and st.score_age_blocks > 600:
+            st.notes.append(f"score is {st.score_age_blocks} blocks old (~{st.score_age_blocks*12/3600:.1f}h)")
+        if st.val_loss_is_stale:
+            # Suppress every derived claim. Reporting "beats baseline" from a
+            # stale gauge against a fresh baseline is worse than reporting
+            # nothing -- it invents a result that was never measured.
+            st.notes.append(
+                f"STALE GAUGE: val_loss {st.val_loss} unchanged since round "
+                f"{st.val_loss_first_round} -- no fresh evaluation yet, "
+                f"delta/rank below are NOT real"
+            )
+            st.delta_loss = None
+        elif st.val_loss is not None and st.baseline_loss is not None:
+            if st.val_loss >= st.baseline_loss:
+                st.notes.append(
+                    f"val_loss {st.val_loss:.5f} >= baseline {st.baseline_loss:.5f} "
+                    f"-> delta 0, scores 0"
+                )
+            elif payload.get("rank3_val_loss") is not None and st.val_loss > payload["rank3_val_loss"]:
+                gap = st.val_loss - payload["best_val_loss"]
+                st.notes.append(f"beats baseline but outside top-3 (gap to rank1: {gap:.6f})")
+
+        # ---- anomaly sweep -------------------------------------------------
+        def alert(sev: str, msg: str) -> None:
+            st.alerts.append([sev, msg])
+            st.notes.append(f"[{sev}] {msg}")
+
+        for which, age in (("train", st.train_log_age), ("commit", st.commit_log_age)):
+            if age is None:
+                alert("CRIT", f"{which} log missing entirely")
+            elif age > LOG_DEAD_SEC:
+                alert("CRIT", f"{which} log silent {age/60:.0f} min -- process hung or dead")
+            elif age > LOG_STALE_SEC:
+                alert("WARN", f"{which} log silent {age/60:.0f} min")
+
+        # Cycle cadence -- the check that would have caught the 08-01 miss.
+        if st.last_commit_age is not None:
+            if st.last_commit_age > COMMIT_MISSED_SEC:
+                alert("CRIT", f"no commit in {st.last_commit_age/60:.0f} min "
+                              f"(~{st.last_commit_age/6300:.1f} cycles) -- MISSED ROUND(S), "
+                              f"scheduler likely lost its place; restart the commit worker")
+            elif st.last_commit_age > COMMIT_LATE_SEC:
+                alert("WARN", f"no commit in {st.last_commit_age/60:.0f} min "
+                              f"(cycle is ~105 min) -- commit window may have been skipped")
+
+        # Training with an idle GPU means hung -- UNLESS the process is young.
+        # Model load takes ~4 min and the poll interval is 3 min, so this check
+        # reliably fired during normal startup and auto-restarted a healthy
+        # miner, forfeiting a cycle. Only flag it once the process has had time
+        # to load.
+        young = (st.train_log_age is not None and st.train_log_age < 60
+                 and log_age_seconds(uid, "train") is not None
+                 and _proc_age_seconds(uid) is not None and _proc_age_seconds(uid) < 600)
+        if st.train_alive and st.gpu_mem_mib < 1000 and not young:
+            alert("CRIT", f"train alive but GPU {gpu} holds only {st.gpu_mem_mib}MiB -- not loaded")
+
+        # Known failure signatures worth catching the FIRST time.
+        tl = LOG_DIR / f"uid{uid}-train.log"
+        cl = LOG_DIR / f"uid{uid}-commit.log"
+        try:
+            tail = ""
+            for f in (tl, cl):
+                if f.is_file():
+                    with f.open("rb") as fh:
+                        fh.seek(max(0, f.stat().st_size - 20000))
+                        tail += fh.read().decode("utf-8", "ignore")
+            # Only consider lines from the last 30 min. Without this a
+            # "Quit training" from YESTERDAY kept re-firing as CRIT forever,
+            # because the sweep just greps the log tail.
+            import re as _re, datetime as _dt
+            cutoff = _dt.datetime.utcnow() - _dt.timedelta(minutes=30)
+            recent = []
+            for ln in tail.splitlines():
+                m = _re.match(r"^\x1b\[[0-9;]*m?(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)|^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", ln)
+                ts = (m.group(1) or m.group(2)) if m else None
+                if ts:
+                    try:
+                        if _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") >= cutoff:
+                            recent.append(ln)
+                    except ValueError:
+                        pass
+                elif recent:
+                    recent.append(ln)
+            tail = "\n".join(recent)
+            for pat, sev, why in (
+                ("OutOfMemoryError", "CRIT", "CUDA OOM"),
+                ("HTTP 429", "WARN", "rate limited (chain or cycle-api)"),
+                ("Quit training", "CRIT", "training loop aborted"),
+                ("upload retries exhausted", "CRIT", "HF upload failed -- round missed"),
+                ("FileNotReadyError", "WARN", "checkpoint not ready at commit time"),
+                ("non-finite", "WARN", "non-finite loss/params"),
+            ):
+                if pat in tail:
+                    alert(sev, f"log contains {pat!r}: {why}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ---- repair --------------------------------------------------------
+        hard = any(a[0] == "CRIT" for a in st.alerts)
+
+        # A CRIT on a SINGLE poll is not enough to restart on. Transient
+        # conditions -- a cycle-api 429 storm, a mid-run model reload that
+        # parks the GPU at 0% -- clear themselves within one interval, and
+        # restarting through one is actively harmful: it drops the miner's
+        # scheduler position and costs the round we were trying to protect.
+        # That is what happened on 2026-08-01 02:32, where an auto-restart of a
+        # healthy uid 250 desynced its commit worker into a 209-min gap.
+        #
+        # A genuinely dead process stays dead, so requiring the same verdict
+        # twice running costs one interval on real failures and suppresses the
+        # transients entirely. A dead tmux window still restarts immediately --
+        # that signal has no false-positive mode.
+        streaks = gauge_state.setdefault("hard_streak", {})
+        streak = streaks.get(str(uid), 0) + 1 if hard else 0
+        streaks[str(uid)] = streak
+        dead = not st.train_alive or not st.commit_alive
+        if hard and streak < 2 and not dead:
+            st.notes.append(f"CRIT poll {streak}/2 -- deferring restart pending confirmation")
+
+        if restart_ok and (dead or (hard and streak >= 2)):
+            # Restart between windows so the process is healthy before the next
+            # MinerCommit1. This does NOT recover the round already missed.
+            st.notes.append("restarting via launch.sh")
+            try:
+                subprocess.run(
+                    [str(OPS_ROOT / "launch.sh"), "start", str(uid)],
+                    capture_output=True, text=True, timeout=180,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.notes.append(f"restart failed: {exc}")
+
+        payload["miners"][str(uid)] = asdict(st)
+
+    _save_gauge_state(gauge_state)
+    return payload
+
+
+def _age(sec) -> str:
+    """Log age for the status table: '3m', or '-' when unknown."""
+    return "-" if sec is None else f"{sec/60:.0f}m"
+
+
+def render(p: dict) -> str:
+    lines = []
+    head = (
+        f"[{p['ts']}] phase={p.get('phase')} "
+        f"blocks_left={p.get('blocks_remaining')} cycle={p.get('cycle_index')} "
+        f"baseline={p.get('baseline_loss')}"
+    )
+    if p.get("best_val_loss") is not None:
+        head += (
+            f" | field={p.get('field_size')} "
+            f"best={p['best_val_loss']:.6f} rank3={p.get('rank3_val_loss')}"
+        )
+    if p.get("dashboard_error"):
+        head += f" | DASHBOARD ERROR: {p['dashboard_error']}"
+    lines.append(head)
+    lines.append(
+        f"  {'uid':>4} {'train':>6} {'commit':>7} {'grp':>6} {'cmt':>4} {'evald':>6} "
+        f"{'logage':>7} {'val_loss':>11} {'chainW':>9} {'age_blk':>8} {'trend':>28}"
+    )
+    for uid, s in sorted(p["miners"].items(), key=lambda kv: int(kv[0])):
+        f = lambda v, spec: (format(v, spec) if isinstance(v, (int, float)) else "-")  # noqa: E731
+        trend = " ".join(f"{v:.3f}" for v in (s.get("loss_trend") or [])[-5:]) or "-"
+        lines.append(
+            f"  {s['uid']:>4} {'up' if s['train_alive'] else 'DOWN':>6} "
+            f"{'up' if s['commit_alive'] else 'DOWN':>7} "
+            f"{str(s.get('cohort_group') or '-'):>6} "
+            f"{('yes' if s.get('committed_this_cycle') else 'NO'):>4} "
+            f"{('yes' if s.get('evaluated_this_round') else 'no'):>6} "
+            f"{_age(s.get('train_log_age')):>7} "
+            f"{f(s['val_loss'], '.6f'):>11} {f(s['chain_weight'], '.5f'):>9} "
+            f"{f(s.get('score_age_blocks'), 'd'):>8} {trend:>34}"
+            f"{'  [STALE]' if s.get('val_loss_is_stale') else ''}"
+        )
+        for n in s["notes"]:
+            lines.append(f"       ! uid {s['uid']}: {n}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interval", type=int, default=60)
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--no-restart", action="store_true")
+    args = ap.parse_args()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    status_log = LOG_DIR / "status.log"
+    status_jsonl = LOG_DIR / "status.jsonl"
+
+    while True:
+        p = collect(restart_ok=not args.no_restart)
+        emit_alerts(p)
+        text = render(p)
+        print(text, flush=True)
+        with status_log.open("a") as fh:
+            fh.write(text + "\n")
+        with status_jsonl.open("a") as fh:
+            fh.write(json.dumps(p) + "\n")
+        for uid, s in p["miners"].items():
+            with (LOG_DIR / f"uid{uid}-status.log").open("a") as fh:
+                fh.write(json.dumps({"ts": p["ts"], **s}) + "\n")
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

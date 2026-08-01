@@ -1,0 +1,30 @@
+diff --git a/connito/shared/helper.py b/connito/shared/helper.py
+index c9871bc..f2f36b8 100644
+--- a/connito/shared/helper.py
++++ b/connito/shared/helper.py
+@@ -48,7 +48,24 @@ def sum_model_gradients(model):
+         total = 0.0
+         for param in model.parameters():
+             if param.grad is not None:
+-                total += param.grad.detach().abs().to(torch.float64).sum().item()
++                # LOCAL PATCH (ops/): was
++                #     param.grad.detach().abs().to(torch.float64).sum()
++                # which materialises TWO full-size temporaries per parameter --
++                # `.abs()` copies the grad, then `.to(float64)` copies it again
++                # at 8 bytes/element. Trainable params are upcast to fp32
++                # (freeze_parameters(upcast_trainable=True)), so a fused expert
++                # grad of ~88M elements cost ~350MB + ~700MB of transient on top
++                # of an already-full card. That is the exact allocation that
++                # OOM'd this miner at 31.08/31.36 GiB on an RTX 5090.
++                #
++                # vector_norm(ord=1) is the same quantity -- sum of absolute
++                # values -- computed as a fused reduction with no full-size
++                # temporary. The accumulate dtype keeps float64 precision.
++                # This value is telemetry only (logged as grad_sum); it does not
++                # feed clipping or the optimizer, so behaviour is unchanged.
++                total += torch.linalg.vector_norm(
++                    param.grad.detach(), ord=1, dtype=torch.float64
++                ).item()
+         return total
+     
+     

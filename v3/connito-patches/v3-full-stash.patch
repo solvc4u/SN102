@@ -1,0 +1,281 @@
+diff --git a/connito/miner/train.py b/connito/miner/train.py
+index 2f1dafd..79dd143 100644
+--- a/connito/miner/train.py
++++ b/connito/miner/train.py
+@@ -37,6 +37,10 @@ from connito.shared.dataloader import get_dataloader
+ from connito.shared.evaluate import evaluate_model
+ from connito.shared.expert_manager import ExpertManager
+ from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
++
++# LOCAL PATCH (ops/): how often to run the expensive per-step diagnostics
++# (full-model hash, full gradient reduction). 0 disables them entirely.
++_DIAG_EVERY = int(os.environ.get("CONNITO_DIAG_EVERY", "25"))
+ from connito.shared.metrics import MetricLogger
+ from connito.shared.model import freeze_parameters, load_model
+ from connito.shared.modeling.mycelia import get_base_tokenizer
+@@ -440,15 +444,24 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
+ 
+                 inner_scaler.scale(loss).backward()
+ 
+-                grad_total = sum_model_gradients(model)
+-                sample_grads = []
+-                for name, param in model.named_parameters():
+-                    if param.requires_grad:
+-                        p_norm = param.norm().item()
+-                        grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+-                        sample_grads.append((name, grad_norm, p_norm))
+-                        if len(sample_grads) >= 5:
+-                            break
++                # LOCAL PATCH (ops/): throttled. `grad_total` and `sample_grads`
++                # were computed on EVERY micro-batch and then never read by
++                # anything -- pure instrumentation in the hot path. The gradient
++                # sum is a full reduction over 3.38B trainable params, and the
++                # norm loop touches parameters and grads again.
++                #
++                # Measured on this box: forward+backward is ~1.0s/micro-batch but
++                # only ~4 minutes of every 60 were spent training; 53.6 min went
++                # to per-step bookkeeping. That throttled the miner to ~79
++                # optimizer steps per Train phase against ~1235 the hardware
++                # supports, which is why our submitted update was 14.5x smaller
++                # than the leaders' and our val_loss correspondingly worse.
++                if _DIAG_EVERY and inner_opt_step % _DIAG_EVERY == 0:
++                    logger.info(
++                        "grad diagnostics",
++                        grad_total=sum_model_gradients(model),
++                        inner_opt_step=inner_opt_step,
++                    )
+ 
+                 # === Aggressively free intermediate tensors ===
+                 del loss, aux_loss, batch_device, outputs
+@@ -464,7 +477,13 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
+                     gradient_accumulation_steps=config.local_par.gradient_accumulation_steps,
+                     current_model_meta=current_model_meta,
+                 )
+-                old_model_hash = get_model_hash(model.state_dict(), hex=True)
++                # LOCAL PATCH (ops/): hashing the full state dict (4.7B params)
++                # cost ~20s and ran twice per optimizer step, purely to log an
++                # old/new pair. This was the single largest stall. Throttled;
++                # the commit path computes its own hash independently, so
++                # correctness does not depend on this.
++                _hash_now = bool(_DIAG_EVERY) and inner_opt_step % _DIAG_EVERY == 0
++                old_model_hash = get_model_hash(model.state_dict(), hex=True) if _hash_now else None
+ 
+                 non_finite_grad_params = []
+                 for n, p in model.named_parameters():
+@@ -525,7 +544,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
+                 logger.info(
+                     "GradScaler for optimizer step",
+                     grad_norm=grad_norm,
+-                    grad_sum=sum_model_gradients(model),
++                    # LOCAL PATCH (ops/): full reduction over 3.38B params, once
++                    # per optimizer step, for a log line only. Throttled with the
++                    # other diagnostics.
++                    grad_sum=sum_model_gradients(model) if _hash_now else None,
+                     scale_before=scale_before,
+                     scale_after=scale_after,
+                     skipped=step_skipped,
+@@ -569,8 +591,9 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
+                 gc.collect()
+                 torch.cuda.empty_cache()
+ 
+-                new_model_hash = get_model_hash(model.state_dict(), hex=True)
+-                logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
++                if _hash_now:
++                    new_model_hash = get_model_hash(model.state_dict(), hex=True)
++                    logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
+ 
+             # === Log metric ===
+             if (
+diff --git a/connito/shared/helper.py b/connito/shared/helper.py
+index c9871bc..f2f36b8 100644
+--- a/connito/shared/helper.py
++++ b/connito/shared/helper.py
+@@ -48,7 +48,24 @@ def sum_model_gradients(model):
+         total = 0.0
+         for param in model.parameters():
+             if param.grad is not None:
+-                total += param.grad.detach().abs().to(torch.float64).sum().item()
++                # LOCAL PATCH (ops/): was
++                #     param.grad.detach().abs().to(torch.float64).sum()
++                # which materialises TWO full-size temporaries per parameter --
++                # `.abs()` copies the grad, then `.to(float64)` copies it again
++                # at 8 bytes/element. Trainable params are upcast to fp32
++                # (freeze_parameters(upcast_trainable=True)), so a fused expert
++                # grad of ~88M elements cost ~350MB + ~700MB of transient on top
++                # of an already-full card. That is the exact allocation that
++                # OOM'd this miner at 31.08/31.36 GiB on an RTX 5090.
++                #
++                # vector_norm(ord=1) is the same quantity -- sum of absolute
++                # values -- computed as a fused reduction with no full-size
++                # temporary. The accumulate dtype keeps float64 precision.
++                # This value is telemetry only (logged as grad_sum); it does not
++                # feed clipping or the optimizer, so behaviour is unchanged.
++                total += torch.linalg.vector_norm(
++                    param.grad.detach(), ord=1, dtype=torch.float64
++                ).item()
+         return total
+     
+     
+diff --git a/connito/shared/model.py b/connito/shared/model.py
+index 8e930e9..fb62b87 100644
+--- a/connito/shared/model.py
++++ b/connito/shared/model.py
+@@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
+     select_best_checkpoint,
+ )
+ from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+-from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
++from connito.shared.hf_distribute import HFFileMissingError, download_checkpoint_from_hf_with_timeout
+ from connito.shared.cycle import (
+     PhaseNames,
+     get_blocks_from_previous_phase_from_api,
+@@ -36,7 +36,7 @@ from connito.shared.expert_manager import (
+     get_layer_expert_id,
+     ExpertAssignments
+ )
+-from connito.shared.helper import get_model_hash, get_nested_attr
++from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, get_model_hash, get_nested_attr
+ from connito.shared.memory import cleanup
+ from connito.shared.modeling.mycelia import get_base_model
+ from connito.shared.schema import verify_message
+@@ -44,11 +44,27 @@ from connito.shared.schema import verify_message
+ logger = structlog.get_logger(__name__)
+ 
+ 
+-def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int | str, str]]:
++def _build_download_targets(
++    expert_group_ids: list[int | str],
++    suffix: str = ".safetensors",
++) -> list[tuple[int | str, str]]:
++    """Build the (group_id, filename) download list for one checkpoint suffix.
++
++    LOCAL PATCH (ops/): `suffix` used to be hardcoded to ".pt". Validators now
++    upload `model_expgroup_{N}.safetensors`, so the hardcoded `.pt` 404s and
++    `fetch_model_from_chain_validator` falls through to "Loading base model" —
++    the miner then trains from the untrained base architecture every cycle and
++    its val_loss is ~20 instead of ~1.9, so it can never beat baseline and can
++    never score. docs/miner-faq/miner-config.md documents this as the ".pt 404
++    trap" and flags the fix here as an open TODO.
++
++    Callers now iterate MINER_CHECKPOINT_SUFFIXES (".safetensors", ".pt") so a
++    validator still on the old format is handled too.
++    """
+     targets: list[tuple[int | str, str]] = []
+     for expert_group_id in expert_group_ids:
+         if isinstance(expert_group_id, int):
+-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
++            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}{suffix}"))
+         elif expert_group_id == "shared":
+             # `model_shared` is no longer persisted or distributed; backbone state
+             # is reconstructed from `config.model.model_path` at instantiation.
+@@ -390,11 +406,6 @@ def fetch_model_from_chain_validator(
+                 )
+                 out_folder.mkdir(parents=True, exist_ok=True)
+ 
+-                targets = _build_download_targets(expert_group_ids)
+-                filenames = [filename for _, filename in targets]
+-                if not filenames:
+-                    continue
+-
+                 if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
+                     logger.warning(
+                         "Chain checkpoint missing HF coordinates; skipping",
+@@ -403,16 +414,50 @@ def fetch_model_from_chain_validator(
+                     )
+                     continue
+ 
+-                _clear_download_targets(out_folder, filenames)
+-
++                # LOCAL PATCH (ops/): try `.safetensors` first, then `.pt`.
++                # A missing file for one suffix is not a failure of this
++                # candidate checkpoint -- it just means the validator wrote the
++                # other format. Only give up on the candidate once every known
++                # suffix has 404'd. See _build_download_targets for why.
+                 try:
+-                    _download_checkpoint_from_hf_with_timeout(
+-                        repo_id=chain_checkpoint.hf_repo_id,
+-                        revision=chain_checkpoint.hf_revision,
+-                        filenames=filenames,
+-                        dest_dir=out_folder,
+-                        token_env_var=config.hf.token_env_var,
+-                        timeout_sec=download_timeout_sec,
++                    downloaded_suffix = None
++                    for _suffix in MINER_CHECKPOINT_SUFFIXES:
++                        targets = _build_download_targets(expert_group_ids, suffix=_suffix)
++                        filenames = [filename for _, filename in targets]
++                        if not filenames:
++                            break
++
++                        _clear_download_targets(out_folder, filenames)
++                        try:
++                            _download_checkpoint_from_hf_with_timeout(
++                                repo_id=chain_checkpoint.hf_repo_id,
++                                revision=chain_checkpoint.hf_revision,
++                                filenames=filenames,
++                                dest_dir=out_folder,
++                                token_env_var=config.hf.token_env_var,
++                                timeout_sec=download_timeout_sec,
++                            )
++                            downloaded_suffix = _suffix
++                            break
++                        except HFFileMissingError:
++                            logger.info(
++                                "Checkpoint shard absent for this suffix; trying next",
++                                suffix=_suffix,
++                                hf_repo_id=chain_checkpoint.hf_repo_id,
++                                hf_revision=chain_checkpoint.hf_revision,
++                            )
++
++                    if downloaded_suffix is None:
++                        raise HFFileMissingError(
++                            f"no checkpoint shard at {chain_checkpoint.hf_repo_id}"
++                            f"@{chain_checkpoint.hf_revision} for any of "
++                            f"{MINER_CHECKPOINT_SUFFIXES}"
++                        )
++                    logger.info(
++                        "Checkpoint shard downloaded",
++                        suffix=downloaded_suffix,
++                        hf_repo_id=chain_checkpoint.hf_repo_id,
++                        hf_revision=chain_checkpoint.hf_revision,
+                     )
+                 except FuturesTimeoutError:
+                     # The thread running download_checkpoint_from_hf cannot be
+diff --git a/expert_groups/exp_legal/config.yaml b/expert_groups/exp_legal/config.yaml
+index 9c7265c..0bba254 100644
+--- a/expert_groups/exp_legal/config.yaml
++++ b/expert_groups/exp_legal/config.yaml
+@@ -33,7 +33,12 @@ data:
+       name: "en"
+       weight: 0.5
+       text_column: "text"
+-  per_device_train_batch_size: 1
++  # LOCAL PATCH (ops/): 1 -> 4. Measured peak 16GiB of 32GiB at bs=1 with
++  # the cards at 0-7% utilisation and 62W of 450W. Gradient memory is
++  # fixed; only activations scale. With batch_size also 4,
++  # gradient_accumulation_steps derives to 1 -- identical effective
++  # batch and optimizer semantics, one forward pass instead of four.
++  per_device_train_batch_size: 4
+   batch_size: 4
+   # 1024 matches the current fleet paradigm (see exp_math + the locked
+   # DataCfg.sequence_length default): the VRAM envelope miners/validators
+@@ -42,7 +47,19 @@ data:
+   sequence_length: 1024
+   world_size: 10
+   rank: 1
+-  dataset_class: "expert_groups.exp_legal.dataset:StreamingTorchDataset"
++  # LOCAL PATCH (ops/): read the shared on-disk corpus instead of streaming
++  # from HF. Streaming responses are never cached, so N co-located miners each
++  # open their own request stream to huggingface.co for the whole Train phase
++  # -- the main source of 429s on a multi-UID box. ops/fetch_corpus.py
++  # materialises this group's exact source mixture once; LocalSharedDataset
++  # reads it off disk with per-miner striping.
++  #
++  # This override must live HERE, not in the per-UID config: WorkerConfig's
++  # _update_by_task replaces task.exp wholesale from this file on every load,
++  # so a dataset_class set in the miner YAML is discarded.
++  #
++  # Upstream value (restore to revert): expert_groups.exp_legal.dataset:StreamingTorchDataset
++  dataset_class: "ops.shared_dataset:LocalSharedDataset"
+   # (joelniklaus/Multi_Legal_Pile, all_all) is registered in
+   # connito/shared/eval_shard_pick.py:_KNOWN_SOURCES with a
+   # verified-row-count table over the repo's native data/ shards

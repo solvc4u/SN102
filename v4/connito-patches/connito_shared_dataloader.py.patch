@@ -1,0 +1,31 @@
+diff --git a/connito/shared/dataloader.py b/connito/shared/dataloader.py
+index 3768298..68a2275 100644
+--- a/connito/shared/dataloader.py
++++ b/connito/shared/dataloader.py
+@@ -541,6 +541,26 @@ def get_dataloader(
+     world_size = world_size if world_size is not None else config.task.exp.data.world_size
+     rank = rank if rank is not None else config.task.exp.data.rank
+ 
++    # LOCAL PATCH (ops/): per-miner training-stream rank.
++    #
++    # `expert_groups/*/config.yaml` ships `rank: 1` with the comment "based on
++    # your uid", but `_update_by_task` re-derives `task.exp` from that file on
++    # every load, so a per-uid override in the miner yaml is discarded. Without
++    # this, every miner on the default config streams the SAME shard slice in
++    # the SAME order; combined with the stock `int_seed = 42`, updates come out
++    # near-identical and the validator's duplicate-submission heuristic zeroes
++    # every tied miner (exact-equal val_loss -> 0.0 for both). Divergence is a
++    # qualification for scoring, not an optimisation.
++    #
++    # Train only: eval keeps the config rank so local val_loss stays comparable
++    # to the validator's baseline, which evaluates the unmodified checkpoint on
++    # its own seeded slice.
++    if train:
++        _env_rank = os.environ.get("CONNITO_DATA_RANK")
++        if _env_rank:
++            rank = int(_env_rank)
++            logger.info("train rank overridden from CONNITO_DATA_RANK", rank=rank, world_size=world_size)
++
+     dataset_class_path = getattr(config.task.exp.data, "dataset_class", None)
+     if dataset_class_path is None:
+         DatasetCls = DefaultStreamingTorchDataset

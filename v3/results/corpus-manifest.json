@@ -1,0 +1,30 @@
+{
+  "expert_group": "exp_legal",
+  "sequence_length": 1024,
+  "rows_requested_per_source": 800000,
+  "sources": [
+    {
+      "path": "joelniklaus/Multi_Legal_Pile",
+      "name": "all_all",
+      "text_column": "text",
+      "weight": 0.5,
+      "rows": 2467871,
+      "shards": 50,
+      "min_chars": 200,
+      "seconds": 701.7,
+      "sampling": "uniform-per-shard",
+      "revision": "911e1d214162fd11d2c78d3f1428cbfcbe07782c"
+    },
+    {
+      "path": "allenai/c4",
+      "name": "en",
+      "text_column": "text",
+      "weight": 0.5,
+      "rows": 779704,
+      "shards": 16,
+      "min_chars": 200,
+      "seconds": 102.2,
+      "sampling": "spread-48-of-1024-shards"
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+run:
+  run_name: uid250
+  root_path: .
+chain:
+  netuid: 102
+  uid: 250
+  hotkey_ss58: 5C4hrjU8tLziZ9BiGdFWBP4CpTYzfJg37XFrha9w3rvnt87s
+  coldkey_ss58: 5HMbfmXmRPxNGRMgBWxi6LLMo37sqPBEbk5TEyeTS5f66HLu
+  ip: 47.233.59.142
+  port: 8002
+  coldkey_name: Apollo
+  hotkey_name: miner5
+  network: archive
+  lite_network: archive
+model:
+  model_path: deepseek-ai/DeepSeek-V2-Lite
+  base_arch_model: deepseek-ai/DeepSeek-V2-Lite
+  foundation: true
+  torch_compile: false
+  attn_implementation: sdpa
+  precision: bf16-mixed
+  device: cuda
+moe:
+  interleave: true
+  num_experts: 8
+  num_experts_per_tok: 2
+  partial_topk: 6
+  full_topk: 2
+  aux_load_balance: true
+  router_aux_loss_coef: 1.0
+  partial_moe: true
+  num_worker_groups: 2
+ckpt:
+  resume_from_ckpt: true
+  strict_sharding: false
+  base_checkpoint_path: checkpoints/miner
+  checkpoint_path: checkpoints/miner/Apollo/miner5/uid250/exp_nemotron_c4
+  checkpoint_interval: 100
+  full_validation_interval: 20
+  checkpoint_topk: 4
+  validator_checkpoint_path: checkpoints/miner/validator_checkpoint
+  download_concurrency: 1
+  use_pretrained_only: false
+  enable_peer_resync: true
+hf:
+  checkpoint_repo: solvc4u/co_lo
+  default_repo_name: co
+  token_env_var: HF_TOKEN
+sched:
+  warmup_steps: 0
+  total_steps: 88000
+log:
+  log_wandb: false
+  wandb_project_name: test-moe
+  wandb_resume: false
+  wandb_full_id: ''
+  wandb_partial_id: []
+  base_metric_path: metrics
+  metric_path: metrics/uid250.csv
+  metric_interval: 100
+opt:
+  lr: 0.0001
+  outer_lr: 0.7
+  outer_momentum: 0.9
+  adamw_optim_bits: 8
+cycle:
+  cycle_length: 448
+  distribute_period: 20
+  train_period: 300
+  commit_period: 10
+  submission_period: 80
+  validate_period: 10
+  merge_period: 50
+  owner_url: https://cycle-api.connito.ai:443
+  version_range_cycles: 3
+  api_timeout_sec: 10
+  api_retries: 5
+  api_backoff_sec: 2
+task:
+  expert_group_name: exp_nemotron_c4
+  load_all_expert_groups: false
+  base_path: /app/expert_groups
+  path: /app/expert_groups/exp_nemotron_c4
+  helper_group_id: 2
+  routing_mode: natural_with_fallback
+dataloader:
+  world_size: 10
+role: miner
+local_par:
+  gradient_accumulation_steps: 1
+  global_opt_interval: 100
+  world_size: 1
+  port: 29500
+  ip_address: 127.0.0.1

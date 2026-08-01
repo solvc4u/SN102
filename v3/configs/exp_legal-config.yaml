@@ -1,0 +1,72 @@
+# group_id 3: 0=exp_math, 1=exp_dummy, 2=exp_c4_p02 (the standing frozen
+# helper slot loaded alongside every active task via TaskCfg.helper_group_id).
+# exp_legal originally claimed 2, before exp_c4_p02 took that slot on master —
+# reusing it would collide in load_expert_group_assignment.
+group_id: 3
+expert_group_name: "exp_legal"
+data:
+  dataset_sources:
+    # `all_all` is the multilingual union of every language/document-type
+    # subset in Multi_Legal_Pile (33 shards, ~500 MB compressed vs
+    # `en_all`'s 2 shards, ~30 MB). We deliberately choose the wider
+    # scope over English-only for anti-memorization: `en_all` totals
+    # only ~36 k rows, which a miner can memorize inside a day of
+    # continuous training. `all_all` gives the validator a much larger
+    # eval pool and lets miners specialize on legal patterns that
+    # generalize across jurisdictions rather than overfit to one
+    # corpus. DeepSeek-V2-Lite handles multilingual text well; the MoE
+    # router will distribute language-specific routing across experts.
+    - path: "joelniklaus/Multi_Legal_Pile"
+      name: "all_all"
+      weight: 0.5
+      text_column: "text"
+      # Required: Multi_Legal_Pile ships a custom builder script
+      # (joelniklaus/Multi_Legal_Pile/Multi_Legal_Pile.py) that HF
+      # refuses to execute without explicit opt-in. The flag is
+      # per-source (see config.DatasetSourceCfg comment) so only
+      # this dataset gets remote-code authorization; c4 below stays
+      # off. When seeded shard-pick is wired up for this source,
+      # also pin the revision via `eval_source_revision_pin` to
+      # bound the executed code to a reviewed SHA.
+      trust_remote_code: true
+    - path: "allenai/c4"
+      name: "en"
+      weight: 0.5
+      text_column: "text"
+  # LOCAL PATCH (ops/): 1 -> 4. Measured peak 16GiB of 32GiB at bs=1 with
+  # the cards at 0-7% utilisation and 62W of 450W. Gradient memory is
+  # fixed; only activations scale. With batch_size also 4,
+  # gradient_accumulation_steps derives to 1 -- identical effective
+  # batch and optimizer semantics, one forward pass instead of four.
+  per_device_train_batch_size: 4
+  batch_size: 4
+  # 1024 matches the current fleet paradigm (see exp_math + the locked
+  # DataCfg.sequence_length default): the VRAM envelope miners/validators
+  # are sized for under natural routing. Legal documents are long, but
+  # context length is a paradigm-wide knob, not a per-group one.
+  sequence_length: 1024
+  world_size: 10
+  rank: 1
+  # LOCAL PATCH (ops/): read the shared on-disk corpus instead of streaming
+  # from HF. Streaming responses are never cached, so N co-located miners each
+  # open their own request stream to huggingface.co for the whole Train phase
+  # -- the main source of 429s on a multi-UID box. ops/fetch_corpus.py
+  # materialises this group's exact source mixture once; LocalSharedDataset
+  # reads it off disk with per-miner striping.
+  #
+  # This override must live HERE, not in the per-UID config: WorkerConfig's
+  # _update_by_task replaces task.exp wholesale from this file on every load,
+  # so a dataset_class set in the miner YAML is discarded.
+  #
+  # Upstream value (restore to revert): expert_groups.exp_legal.dataset:StreamingTorchDataset
+  dataset_class: "ops.shared_dataset:LocalSharedDataset"
+  # (joelniklaus/Multi_Legal_Pile, all_all) is registered in
+  # connito/shared/eval_shard_pick.py:_KNOWN_SOURCES with a
+  # verified-row-count table over the repo's native data/ shards
+  # (row_count_source="verified_table", pinned revision, script-bypass
+  # json loading — the launch-period legacy-path shortcut from
+  # docs/exp-legal-migration-plan.md §2 is retired). Note the eval
+  # pool is the native Multi_Legal_Pile files; the miner TRAINING
+  # stream still goes through the all_all builder script, so eval
+  # remains a subset of the training distribution.
+  eval_source_seeded_shard_pick: true

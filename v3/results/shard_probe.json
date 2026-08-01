@@ -1,0 +1,123 @@
+{
+  "checkpoint": "/data/checkpoints/miner/Apollo/miner5/uid250/exp_legal/globalver_8732296_inneropt_15400",
+  "per_shard": {
+    "data/bg/legislation/bulgaria_marcell.jsonl.xz": {
+      "mean": 0.693803424530841,
+      "n_batches": 47
+    },
+    "data/cs/caselaw/czechia_constitutional_court.jsonl.xz": {
+      "mean": 0.4537429402892788,
+      "n_batches": 48
+    },
+    "data/cs/caselaw/czechia_supreme_administrative_court.jsonl.xz": {
+      "mean": 0.3624015903721253,
+      "n_batches": 48
+    },
+    "data/cs/caselaw/czechia_supreme_court.jsonl.xz": {
+      "mean": 0.4824972866723935,
+      "n_batches": 48
+    },
+    "data/da/legislation/denmark_ddsc.jsonl.xz": {
+      "mean": 1.1166504335900147,
+      "n_batches": 48
+    },
+    "data/de/caselaw/germany_openlegaldata.jsonl.xz": {
+      "mean": 1.0663441084325314,
+      "n_batches": 48
+    },
+    "data/de/caselaw/switzerland_entscheidsuche.jsonl.xz": {
+      "mean": 0.9333342897395293,
+      "n_batches": 48
+    },
+    "data/de/legislation/germany_openlegaldata.jsonl.xz": {
+      "mean": 1.0616259669715709,
+      "n_batches": 44
+    },
+    "data/de/legislation/switzerland_lexfind.jsonl.xz": {
+      "mean": 0.7355867315394183,
+      "n_batches": 48
+    },
+    "data/en/legislation/uk_uk_lex.jsonl.xz": {
+      "mean": 0.760145495546625,
+      "n_batches": 47
+    },
+    "data/fr/caselaw/france_cass.jsonl.xz": {
+      "mean": 0.9456808284709328,
+      "n_batches": 38
+    },
+    "data/fr/caselaw/luxembourg_judoc.jsonl.xz": {
+      "mean": 0.8382800370454788,
+      "n_batches": 48
+    },
+    "data/fr/caselaw/switzerland_entscheidsuche.jsonl.xz": {
+      "mean": 0.9248885052899519,
+      "n_batches": 48
+    },
+    "data/fr/legislation/belgium_ejustice.jsonl.xz": {
+      "mean": 0.699730172753334,
+      "n_batches": 47
+    },
+    "data/fr/legislation/switzerland_lexfind.jsonl.xz": {
+      "mean": 0.7893472467549145,
+      "n_batches": 48
+    },
+    "data/hu/legislation/hungary_marcell.jsonl.xz": {
+      "mean": 0.42511600193878013,
+      "n_batches": 48
+    },
+    "data/it/caselaw/switzerland_entscheidsuche.jsonl.xz": {
+      "mean": 0.9613364152610302,
+      "n_batches": 48
+    },
+    "data/nl/legislation/belgium_ejustice.jsonl.xz": {
+      "mean": 0.7864656172071894,
+      "n_batches": 48
+    },
+    "data/pl/legislation/poland_marcell.jsonl.xz": {
+      "mean": 0.48454175361742574,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_cjpg_0.jsonl.xz": {
+      "mean": 0.6901740434889992,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_cjpg_1.jsonl.xz": {
+      "mean": 0.6514897358914217,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_cjpg_2.jsonl.xz": {
+      "mean": 0.6742071559031805,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_cjpg_3.jsonl.xz": {
+      "mean": 0.5715063735842705,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_cjpg_4.jsonl.xz": {
+      "mean": 0.6083392199749748,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_creta.jsonl.xz": {
+      "mean": 0.5192239989216129,
+      "n_batches": 48
+    },
+    "data/pt/caselaw/brazil_rulingbr.jsonl.xz": {
+      "mean": 0.7197091697404782,
+      "n_batches": 48
+    },
+    "data/ro/legislation/romania_marcell.jsonl.xz": {
+      "mean": 0.48669643327593803,
+      "n_batches": 48
+    },
+    "data/sk/legislation/slovakia_marcell.jsonl.xz": {
+      "mean": 0.47170873715852696,
+      "n_batches": 48
+    },
+    "data/sl/legislation/slovenia_marcell.jsonl.xz": {
+      "mean": 0.6816546758636832,
+      "n_batches": 48
+    }
+  },
+  "spread": 0.7542488432178893,
+  "mean": 0.7102147720629811
+}
