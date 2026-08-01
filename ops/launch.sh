@@ -205,6 +205,16 @@ start_one() {
   local train_cmd="cd $CONNITO_ROOT && ${envs[*]} $VENV/bin/python -m ops.autolr --uid $uid --path $config 2>&1 | tee -a $train_log"
   local commit_cmd="cd $CONNITO_ROOT && ${envs[*]} $VENV/bin/python -m ops.commit --path $config 2>&1 | tee -a $commit_log"
 
+  # Stash both commands so cmd_respawn can recreate a window that tmux has
+  # already destroyed. tmux drops a window when its command exits, so a trainer
+  # that dies takes its window with it -- and `respawn-window` cannot target a
+  # window that no longer exists. Writing them here keeps the recreated command
+  # byte-identical to the one that was launched, rather than rebuilt from a
+  # second copy of this env block that could drift.
+  mkdir -p "$OPS_ROOT/.cmds"
+  printf '%s' "$train_cmd"  > "$OPS_ROOT/.cmds/uid$uid-train.cmd"
+  printf '%s' "$commit_cmd" > "$OPS_ROOT/.cmds/uid$uid-commit.cmd"
+
   tmux new-session  -d -s "$session" -n train "$train_cmd"
   tmux new-window  -t "$session" -n commit "$commit_cmd"
   echo "started uid $uid on GPU $gpu (tmux: $session [train|commit])"
@@ -289,8 +299,23 @@ cmd_respawn() {
   case "$win" in train|commit) ;; *) echo "window must be train|commit" >&2; return 1 ;; esac
   local session="sn102-$uid"
   tmux has-session -t "$session" 2>/dev/null || { echo "no session $session -- use start" >&2; return 1; }
-  tmux respawn-window -k -t "$session:$win" || return 1
-  echo "respawned $session:$win (other window untouched)"
+
+  # If the window still exists, respawn in place -- tmux reuses its original
+  # command. If the process already exited, tmux destroyed the window with it,
+  # and respawn-window has nothing to target; recreate it from the command
+  # stashed at launch. Without this, a DEAD trainer (the case auto-repair most
+  # needs to handle) is unrepairable: uid 178's trainer exited at 12:28 on
+  # 2026-08-01 and sat down 4.6 hours while the monitor reported a respawn each
+  # poll and tmux rejected it for a missing window.
+  if tmux list-panes -t "$session:$win" >/dev/null 2>&1; then
+    tmux respawn-window -k -t "$session:$win" || return 1
+    echo "respawned $session:$win (other window untouched)"
+  else
+    local cmd_file="$OPS_ROOT/.cmds/uid$uid-$win.cmd"
+    [[ -f "$cmd_file" ]] || { echo "window $win gone and no stashed command at $cmd_file -- use restart" >&2; return 1; }
+    tmux new-window -d -t "$session" -n "$win" "$(cat "$cmd_file")" || return 1
+    echo "recreated $session:$win from stashed command (other window untouched)"
+  fi
 }
 
 case "${1:-}" in

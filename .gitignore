@@ -24,3 +24,6 @@ __pycache__/
 *.bak
 *.swp
 *.tmp
+
+# Stashed launch commands — contain HF tokens in the env block
+ops/.cmds/
