@@ -97,6 +97,21 @@ DISK_WARN_PCT = int(os.environ.get("CONNITO_DISK_WARN_PCT", "85"))
 # are kept indefinitely for a possible return to that task.
 PRUNABLE_GROUPS = ("exp_nemotron_c4",)
 
+# ---- settings drift -----------------------------------------------------
+# Two settings carry the whole v4 thesis, and both fail silently.
+#
+# `expert_group_name` is a locked field the subnet resets on load, so an
+# upstream switch (exactly what happened on 2026-08-01) migrates us without
+# announcement -- and a miner left on a retired group trains work no validator
+# will score.
+#
+# `CONNITO_DATA_RANK` is worse: if it is dropped, training continues perfectly
+# and the loss curve looks fine, but both miners silently fall back to the
+# stock rank 1, collide with the field, and get tie-zeroed. There is no symptom
+# in the logs -- only a score that never arrives. Assert both every poll.
+EXPECTED_GROUP = os.environ.get("CONNITO_EXPECTED_GROUP", "exp_nemotron_c4")
+EXPECTED_RANK = {250: 3, 178: 7, 121: 5}
+
 # uid -> (gpu, hf repo env var). MUST match the MINERS table in launch.sh --
 # a stale mapping here reports another miner's VRAM against the wrong uid.
 MINERS = {
@@ -657,9 +672,49 @@ def collect(restart_ok: bool) -> dict:
                 ("upload retries exhausted", "CRIT", "HF upload failed -- round missed"),
                 ("FileNotReadyError", "WARN", "checkpoint not ready at commit time"),
                 ("non-finite", "WARN", "non-finite loss/params"),
+                # v4: Nemotron-CC-Math is gated. If the HF account behind the
+                # token loses access the miner dies at dataloader build, not at
+                # startup, so it reads like a training fault rather than a
+                # permissions one.
+                ("GatedRepoError", "CRIT", "gated dataset access lost -- accept the Nemotron licence"),
+                # v4: the ENOSPC signature. A full volume truncates torch.save
+                # and aborts the loop; this is what cost cycle 16693.
+                ("enforce fail at inline_container", "CRIT", "truncated checkpoint write -- disk full"),
+                ("No space left on device", "CRIT", "disk full"),
             ):
                 if pat in tail:
                     alert(sev, f"log contains {pat!r}: {why}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ---- settings drift ------------------------------------------------
+        # Read back what the process actually resolved at startup rather than
+        # what the yaml claims -- `_update_by_task` rewrites config on load, so
+        # the file and the running process can disagree. Scans the whole log
+        # (not the 30-min recency window used above) because both markers are
+        # printed once, at startup.
+        try:
+            whole = ""
+            for f in (LOG_DIR / f"uid{uid}-train.log",):
+                if f.exists():
+                    with f.open("rb") as fh:
+                        fh.seek(max(0, f.stat().st_size - 4_000_000))
+                        whole = fh.read().decode("utf-8", "replace")
+            # structlog interleaves ANSI between key and value
+            # (`\x1b[36mrank\x1b[0m=\x1b[35m3\x1b[0m`), so strip before matching.
+            whole = ANSI_RE.sub("", whole)
+            groups = re.findall(r'"expert_group_name":\s*"([^"]+)"', whole)
+            if groups and groups[-1] != EXPECTED_GROUP:
+                alert("CRIT", f"expert group is {groups[-1]!r}, expected {EXPECTED_GROUP!r} "
+                              f"-- training work no validator will score")
+            ranks = re.findall(r"train rank overridden from CONNITO_DATA_RANK.*?rank=(\d+)", whole)
+            want = EXPECTED_RANK.get(uid)
+            if want is not None and groups:
+                if not ranks:
+                    alert("CRIT", "no CONNITO_DATA_RANK override seen -- fell back to stock rank 1, "
+                                  "which tie-zeroes against the field")
+                elif int(ranks[-1]) != want:
+                    alert("CRIT", f"data rank is {ranks[-1]}, expected {want}")
         except Exception:  # noqa: BLE001
             pass
 
