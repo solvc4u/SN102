@@ -179,9 +179,28 @@ def cmd_history(args) -> int:
 # weight comparison
 # --------------------------------------------------------------------------
 def _download(repo: str, filename: str, revision: str | None, token: str) -> Path:
+    """Fetch a checkpoint shard, tolerating the two ways the dashboard misleads.
+
+    The `hf_revision` the leaderboard reports is often unreachable -- either the
+    miner force-pushed over it (RevisionNotFoundError) or that revision predates
+    the group-4 file (EntryNotFoundError). Both are the rival's repo history, not
+    our bug, and both are recoverable: fall back to the branch head, and then to
+    the group-3 filename for miners who have not migrated. Two of three rivals
+    were unusable before this.
+    """
     from huggingface_hub import hf_hub_download
-    return Path(hf_hub_download(repo_id=repo, filename=filename, revision=revision,
-                                token=token, cache_dir=os.environ.get("HF_HOME")))
+    cache = os.environ.get("HF_HOME")
+    attempts = [(filename, revision), (filename, None)]
+    if filename.endswith("_4.safetensors"):
+        attempts.append((filename.replace("_4.", "_3."), None))
+    last: Exception | None = None
+    for fn, rev in attempts:
+        try:
+            return Path(hf_hub_download(repo_id=repo, filename=fn, revision=rev,
+                                        token=token, cache_dir=cache))
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise last  # type: ignore[misc]
 
 
 def _delta_stats(rival_path: Path, base_path: Path, ours_path: Path | None):
