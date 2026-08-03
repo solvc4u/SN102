@@ -39,15 +39,25 @@ mkdir -p "$LOG_DIR"
 #
 # data_rank shards the TRAINING stream via split_dataset_by_node over
 # world_size 10 (see the CONNITO_DATA_RANK patch in shared/dataloader.py).
-# Deliberately NOT 1: `expert_groups/*/config.yaml` ships `rank: 1`, so every
-# miner running the stock config streams that same slice. Ranks 3/7/5 are
-# spread across the partition so our miners collide neither with the field nor
-# with each other -- identical updates get mutually zeroed by the validator's
-# duplicate heuristic, so distinct data is a precondition for scoring at all.
+#
+# All three share rank 2 ON PURPOSE. The point of running three miners is to
+# compare learning rates, and that comparison is only readable if the training
+# data is held constant -- different ranks meant every LR result was confounded
+# by a different slice of the stream.
+#
+# Still NOT rank 1: the stock `expert_groups/*/config.yaml` ships `rank: 1`, so
+# the whole default field trains that slice, and a miner whose val_loss lands
+# exactly equal to another's is zeroed along with it. Sharing rank 2 among our
+# own three is safe because they run different learning rates, so their updates
+# differ even on identical data -- the duplicate heuristic keys on the RESULT,
+# not the input.
+#
+# The seed is shared for the same reason: it permutes shard order, so leaving
+# it per-uid would have reintroduced a different data ORDER at the same rank.
 MINERS=(
   "250:0:HOTKEY_UID250:HF_TOKEN_UID250:PROXY_UID250:3303:2"
-  "178:2:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:2202:7"
-  "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:1101:8"
+  "178:2:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:3303:2"
+  "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:3303:2"
 )
 
 # uids started by a bare `start`. 121 is a candidate and stays out until 250

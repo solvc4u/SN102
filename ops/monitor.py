@@ -110,13 +110,13 @@ PRUNABLE_GROUPS = ("exp_nemotron_c4",)
 # stock rank 1, collide with the field, and get tie-zeroed. There is no symptom
 # in the logs -- only a score that never arrives. Assert both every poll.
 EXPECTED_GROUP = os.environ.get("CONNITO_EXPECTED_GROUP", "exp_nemotron_c4")
-EXPECTED_RANK = {250: 2, 178: 7, 121: 8}
+EXPECTED_RANK = {250: 2, 178: 2, 121: 2}
 
 # uid -> (gpu, hf repo env var). MUST match the MINERS table in launch.sh --
 # a stale mapping here reports another miner's VRAM against the wrong uid.
 MINERS = {
     250: (0, "HF_REPO_UID250"),
-    178: (1, "HF_REPO_UID178"),
+    178: (2, "HF_REPO_UID178"),
     121: (1, "HF_REPO_UID121"),
 }
 
