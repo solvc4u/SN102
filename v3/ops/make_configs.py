@@ -48,9 +48,16 @@ OPS = Path(os.environ.get("OPS_ROOT", "/root/SN102/ops"))
 CONFIG_DIR = OPS / "configs"
 
 # uid -> (hotkey env var, repo env var, axon port, data stripe)
+# uid -> (hotkey env, repo env, axon port, data stripe)
+#
+# The stripe is the miner's slot in the shared training stream. It must differ
+# per uid AND differ from the stock `rank: 1` that the shipped expert-group
+# config ships with: two miners producing an exactly equal val_loss are BOTH
+# zeroed by the duplicate-submission heuristic, so divergence is a precondition
+# for being scored at all, not a tuning knob.
 MINERS = {
-    121: ("HOTKEY_UID121", "HF_REPO_UID121", 8000, 0),
-    178: ("HOTKEY_UID178", "HF_REPO_UID178", 8001, 1),
+    121: ("HOTKEY_UID121", "HF_REPO_UID121", 8000, 8),
+    178: ("HOTKEY_UID178", "HF_REPO_UID178", 8001, 7),
     250: ("HOTKEY_UID250", "HF_REPO_UID250", 8002, 2),
 }
 

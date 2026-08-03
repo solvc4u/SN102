@@ -45,9 +45,9 @@ mkdir -p "$LOG_DIR"
 # with each other -- identical updates get mutually zeroed by the validator's
 # duplicate heuristic, so distinct data is a precondition for scoring at all.
 MINERS=(
-  "250:0:HOTKEY_UID250:HF_TOKEN_UID250:PROXY_UID250:3303:3"
+  "250:0:HOTKEY_UID250:HF_TOKEN_UID250:PROXY_UID250:3303:2"
   "178:1:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:2202:7"
-  "121:2:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:1101:5"
+  "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:1101:8"
 )
 
 # uids started by a bare `start`. 121 is a candidate and stays out until 250
@@ -75,7 +75,7 @@ phase_guard() {
 import urllib.request, json
 try:
     d = json.load(urllib.request.urlopen(urllib.request.Request(
-        "https://dashboard-api-v2.connito.ai/api/v3/leaderboard",
+        "https://dashboard-dev.connito.ai/api/gw/api/v2/leaderboard",
         headers={"User-Agent": "sn102-launch"}), timeout=20))["data"]["phase"]
     print(f'{d["name"]} {d["blocks_remaining"]}')
 except Exception:
@@ -103,12 +103,18 @@ PYG
 
 preflight() {
   [[ -d "$VENV" ]] || { echo "no venv at $VENV — run ops/setup_env.sh first" >&2; exit 1; }
-  local manifest="$CORPUS_DIR/${EXPERT_GROUP:-exp_legal}/manifest.json"
-  if [[ ! -f "$manifest" ]]; then
-    echo "no shared corpus at $manifest" >&2
-    echo "run: python ops/fetch_corpus.py --expert-group ${EXPERT_GROUP:-exp_legal}" >&2
-    exit 1
-  fi
+  # A local corpus is only required when a uid is actually pointed at one via
+  # ops/dataset_<uid>.txt. The default is HF streaming, which needs no manifest,
+  # and demanding one here blocked startup after the retired legal corpus was
+  # cleared.
+  for f in "$OPS_ROOT"/dataset_*.txt; do
+    [[ -e "$f" ]] || continue
+    if grep -q "LocalSharedDataset" "$f" 2>/dev/null; then
+      local grp="${EXPERT_GROUP:-exp_nemotron_c4}"
+      local manifest="$CORPUS_DIR/$grp/manifest.json"
+      [[ -f "$manifest" ]] || { echo "no local corpus at $manifest (needed by $(basename "$f"))" >&2; exit 1; }
+    fi
+  done
   command -v tmux >/dev/null || { echo "tmux not installed: apt-get install -y tmux" >&2; exit 1; }
 }
 

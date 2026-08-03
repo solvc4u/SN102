@@ -66,11 +66,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PHASE_API = "https://cycle-api.connito.ai/get_phase"
-DASHBOARD_API = "https://dashboard-api-v2.connito.ai/api/v1/leaderboard"
+# The endpoint the dashboard UI itself calls. v1 served val_loss from a
+# Prometheus gauge that is never cleared at round rollover, so most miners show
+# a stale number with no way to tell which; dashboard-api-v2 /api/v3 lags the UI
+# by one to two cycles. This one agrees with the UI exactly, and the tuner is
+# only as good as the feedback it optimises against.
+DASHBOARD_API = os.environ.get(
+    "CONNITO_DASHBOARD_API",
+    "https://dashboard-dev.connito.ai/api/gw/api/v2/leaderboard")
 
 # Log-spaced peak-LR grid. Centred an order of magnitude around the stock 1e-4
 # so the tuner can discover that stock is optimal if it in fact is.
 LR_GRID = [2e-5, 3e-5, 5e-5, 7e-5, 1e-4, 1.4e-4, 2e-4, 3e-4, 4e-4, 6e-4]
+# Where the search starts before any result exists for this uid. Operator
+# choice, not a measurement -- the tuner walks away from it as soon as scored
+# rounds arrive.
+START_LR = float(os.environ.get("CONNITO_START_LR", "3e-4"))
 WARMUP_GRID = [0.0, 0.03, 0.10]
 MIN_LR_FRAC_GRID = [0.02, 0.10]
 
@@ -261,6 +272,12 @@ class Tuner:
 
         rng = random.Random(cycle_index * 7919 + self.uid)
 
+        # No scored round for this uid yet -> start where the operator asked
+        # rather than at whatever grid cell the sweep index lands on. Once even
+        # one result exists the sweep takes over and this never fires again.
+        if not rows:
+            return (START_LR, 0.03, 0.02)
+
         if len(rows) < EXPLORE_CYCLES:
             # Deterministic sweep so the three UIDs cover the grid in parallel
             # rather than all racing to the same cell.
@@ -311,7 +328,19 @@ class Tuner:
         for m in data.get("leaderboard", []):
             if int(m.get("uid", -1)) != self.uid:
                 continue
+            # gw/v2 reports val_loss per validator slot, not at top level.
+            # Take the freshest ok sample rather than the first or the min --
+            # min() picks whichever validator likes us best, which flattered
+            # our numbers badly enough to drive two wrong config changes.
             vl = m.get("val_loss")
+            if vl is None:
+                cands = [v for v in (m.get("validator_metrics") or [])
+                         if v.get("val_loss") is not None]
+                if cands:
+                    vl = max(cands, key=lambda v: (
+                        v.get("sample_cycle") if v.get("sample_cycle") is not None else -1,
+                        1 if v.get("eval_status_label") == "ok" else 0,
+                    )).get("val_loss")
             if vl is None:
                 print(f"[autolr] uid {self.uid}: no val_loss recorded this round")
                 return

@@ -1,8 +1,52 @@
 diff --git a/connito/shared/dataloader.py b/connito/shared/dataloader.py
-index 3768298..1ce92da 100644
+index 3768298..c34546e 100644
 --- a/connito/shared/dataloader.py
 +++ b/connito/shared/dataloader.py
-@@ -541,7 +541,48 @@ def get_dataloader(
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import json
+ import itertools
+ import os
+ import random
+@@ -219,6 +220,36 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
+         legacy_dataset_name = getattr(config.task.exp.data, "dataset_name", None)
+         legacy_data_dir = getattr(config.task.exp.data, "data_dir", None)
+ 
++        # LOCAL PATCH (ops/): per-uid training source, changeable without a
++        # restart. `dataset_sources` comes from the shared expert-group config,
++        # which `_update_by_task` rebuilds from disk on every load, so a per-uid
++        # value in the miner yaml is silently discarded -- same trap as `rank`.
++        #
++        # This is read where the dataloader is BUILT, so when the subnet moves
++        # to a different dataset repo the change is one file and takes effect on
++        # the next dataloader rebuild rather than costing a round to a restart.
++        # Written by `python -m ops.setcfg data <uid> <repo>[:<subset>]`.
++        _src_path = os.environ.get(
++            "CONNITO_DATASOURCE_OVERRIDE",
++            f"/root/SN102/ops/datasource_{os.environ.get('CONNITO_UID','')}.json")
++        try:
++            with open(_src_path) as _fh:
++                _spec = json.load(_fh)
++            if _spec.get("path"):
++                from connito.shared.config import DatasetSourceCfg
++                configured_sources = [DatasetSourceCfg(
++                    path=_spec["path"],
++                    name=_spec.get("name"),
++                    weight=float(_spec.get("weight", 1.0)),
++                    text_column=_spec.get("text_column", "text"),
++                )]
++                logger.info("dataset source overridden from file",
++                            path=_spec["path"], name=_spec.get("name"), file=_src_path)
++        except FileNotFoundError:
++            pass
++        except Exception as _exc:  # noqa: BLE001 - never break the dataloader on a bad file
++            logger.warning("ignoring bad datasource override", file=_src_path, error=str(_exc))
++
+         if configured_sources:
+             source_specs = configured_sources
+             if not source_specs:
+@@ -541,7 +572,48 @@ def get_dataloader(
      world_size = world_size if world_size is not None else config.task.exp.data.world_size
      rank = rank if rank is not None else config.task.exp.data.rank
  

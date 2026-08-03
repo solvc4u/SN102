@@ -1,6 +1,6 @@
 run:
   run_name: uid178
-  root_path: .
+  root_path: /data
 chain:
   netuid: 102
   uid: 178
@@ -33,17 +33,17 @@ moe:
 ckpt:
   resume_from_ckpt: true
   strict_sharding: false
-  base_checkpoint_path: checkpoints/miner
-  checkpoint_path: checkpoints/miner/Apollo/miner2/uid178/exp_nemotron_c4
+  base_checkpoint_path: /data/checkpoints/miner
+  checkpoint_path: /data/checkpoints/miner/template_coldkey_name/template_hotkey_name/foundation/exp_nemotron_c4
   checkpoint_interval: 100
   full_validation_interval: 20
   checkpoint_topk: 2
-  validator_checkpoint_path: checkpoints/miner/validator_checkpoint
+  validator_checkpoint_path: /data/checkpoints/miner/validator_checkpoint
   download_concurrency: 1
   use_pretrained_only: false
   enable_peer_resync: true
 hf:
-  checkpoint_repo: solvc4u/co2
+  checkpoint_repo: solvc4u/sn102-178
   default_repo_name: co
   token_env_var: HF_TOKEN
 sched:
@@ -55,8 +55,8 @@ log:
   wandb_resume: false
   wandb_full_id: ''
   wandb_partial_id: []
-  base_metric_path: metrics
-  metric_path: metrics/uid178.csv
+  base_metric_path: /data/metrics
+  metric_path: /data/metrics/foundation.csv
   metric_interval: 100
 opt:
   lr: 0.0001
@@ -81,6 +81,37 @@ task:
   load_all_expert_groups: false
   base_path: /app/expert_groups
   path: /app/expert_groups/exp_nemotron_c4
+  exp:
+    data:
+      dataset_name: allenai/c4
+      data_dir: en
+      dataset_sources:
+      - path: allenai/c4
+        name: en
+        weight: 0.5
+        text_column: text
+        trust_remote_code: false
+      - path: nvidia/Nemotron-CC-Math-v1
+        name: 4plus
+        weight: 0.5
+        text_column: text
+        trust_remote_code: false
+      batch_size: 4
+      sequence_length: 1024
+      per_device_train_batch_size: 1
+      world_size: 3
+      rank: 7
+      dataset_class: ops.shared_dataset:LocalSharedDataset
+      vali_fraction: 0.1
+      eval_source_shuffle_buffer: 50000
+      eval_source_skip_max: 50000
+      eval_source_seeded_shard_pick: true
+      eval_source_revision_pin:
+        allenai/c4: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
+        nvidia/Nemotron-CC-Math-v1: 397a2502f2028c659ba411a6c4935b464a7f03aa
+      eval_min_text_chars: 200
+      eval_dedup_prefix_chars: 200
+    group_id: 4
   helper_group_id: 2
   routing_mode: natural_with_fallback
 dataloader:

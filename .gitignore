@@ -27,3 +27,8 @@ __pycache__/
 
 # Stashed launch commands — contain HF tokens in the env block
 ops/.cmds/
+
+# Any .env variant, including timestamped backups. ops/.env.bak.* reached a
+# commit once and was caught by GitHub push protection, not by this file.
+ops/.env*
+**/.env*
