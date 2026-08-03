@@ -40,7 +40,14 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-DASHBOARD = "https://dashboard-api-v2.connito.ai/api/v3/leaderboard"
+# The endpoint the dashboard UI itself calls. The one used before
+# (dashboard-api-v2 /api/v3/leaderboard) serves a leaderboard that lags by one
+# to two cycles: on 2026-08-03 it reported uid 178 at 2.3715 from cycle 16719
+# while the UI and this endpoint both showed 3.5572 for the live round. Two
+# configuration changes were made on the strength of that stale number.
+DASHBOARD = os.environ.get(
+    "CONNITO_DASHBOARD_API",
+    "https://dashboard-dev.connito.ai/api/gw/api/v2/leaderboard")
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/root/SN102/logs"))
 SNAPSHOT_FILE = LOG_DIR / "rivals.jsonl"
 OUR_UIDS = {250, 178, 121}
@@ -69,9 +76,38 @@ def fetch_leaderboard(attempts: int = 10) -> dict:
 
 
 def _val_loss(m: dict) -> float | None:
-    vs = [v.get("val_loss") for v in (m.get("validator_metrics") or [])
-          if v.get("val_loss") is not None]
-    return min(vs) if vs else None
+    """Loss from the FRESHEST validator sample, not the most flattering one.
+
+    This used to return min() across slots. That is wrong twice over: it picks
+    whichever validator likes us best, and it happily returns a stale sample
+    when a newer worse one exists. On 2026-08-03 it reported uid 178 at 2.3715
+    from a cycle-16719 sample while the dashboard showed 3.5572 for the current
+    cycle -- and two changes were made on the strength of that number.
+
+    Prefer the highest sample_cycle; break ties on lowest sample_age_blocks.
+    """
+    cands = [v for v in (m.get("validator_metrics") or []) if v.get("val_loss") is not None]
+    if not cands:
+        return None
+    # The gw/v2 endpoint omits sample_cycle/sample_age_blocks entirely (they come
+    # back None), so ordering by them alone silently degrades to "first slot".
+    # Rank by freshness where it is reported, then by eval_status_label == ok.
+    def key(v):
+        return (v.get("sample_cycle") if v.get("sample_cycle") is not None else -1,
+                1 if v.get("eval_status_label") == "ok" else 0,
+                -(v.get("sample_age_blocks") if v.get("sample_age_blocks") is not None else 1 << 30))
+    return max(cands, key=key).get("val_loss")
+
+
+def _val_loss_detail(m: dict) -> list[str]:
+    """Per-slot view, so a disagreement between validators is visible."""
+    out = []
+    for v in (m.get("validator_metrics") or []):
+        out.append(f"slot{v.get('validator_slot')}="
+                   f"{('%.4f' % v['val_loss']) if v.get('val_loss') is not None else v.get('eval_status_label') or '-'}"
+                   f"@c{v.get('sample_cycle')}"
+                   f"{'' if v.get('sample_is_fresh') else '(stale)'}")
+    return out
 
 
 def rows_from(data: dict) -> list[dict]:
@@ -110,9 +146,14 @@ def cmd_snapshot(_args) -> int:
     ours = [r for r in rec["miners"] if r["uid"] in OUR_UIDS]
     print(f"[{rec['ts']}] cycle={rec['cycle']} phase={rec['phase']} "
           f"baseline={rec['baseline']} scored={len(scored)}")
+    lb = data["leaderboard"]
+    lb = lb if isinstance(lb, list) else list(lb.values())
+    detail = {m["uid"]: _val_loss_detail(m) for m in lb}
     for r in sorted(ours, key=lambda x: x["uid"]):
         print(f"   uid {r['uid']}: val_loss={r['val_loss']} cohort={r['cohort']} "
               f"inc={r['incentive']:.5f}")
+        if detail.get(r["uid"]):
+            print(f"            {'  '.join(detail[r['uid']])}")
     return 0
 
 

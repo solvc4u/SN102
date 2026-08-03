@@ -67,7 +67,7 @@ from pathlib import Path
 # history and the cohort group that actually determines whether weight is
 # earned. Reading v1 all day produced several wrong conclusions -- comparing our
 # current loss against leaders' stale values from an easier baseline.
-DASHBOARD_API = "https://dashboard-api-v2.connito.ai/api/v3/leaderboard"
+DASHBOARD_API = "https://dashboard-dev.connito.ai/api/gw/api/v2/leaderboard"
 import re
 import shutil
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

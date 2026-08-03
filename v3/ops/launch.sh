@@ -176,6 +176,12 @@ start_one() {
         else
             echo "$OPS_ROOT/lr_override.json"
         fi)"
+    # Per-uid dataset source, so local-vs-streaming can actually be A/B'd:
+    # `dataset_class` is in the shared group config, so without this both
+    # miners always match. Write "default" into ops/dataset_<uid>.txt to force
+    # HF streaming for that uid, or a "pkg.mod:Class" path to force a class.
+    ${DATASET_CLASS_OVERRIDE:+"CONNITO_DATASET_CLASS=$DATASET_CLASS_OVERRIDE"}
+    $(f="$OPS_ROOT/dataset_$uid.txt"; [[ -f "$f" ]] && echo "CONNITO_DATASET_CLASS=$(tr -d '\n' < "$f")")
     "PYTHONPATH=$CONNITO_ROOT:/root/SN102"
     # 31.4GiB cards vs the 47GB A6000 this config is sized for. The first OOM
     # showed 2.16GiB "reserved but unallocated" -- pure fragmentation.

@@ -1,8 +1,8 @@
 diff --git a/connito/shared/dataloader.py b/connito/shared/dataloader.py
-index 3768298..68a2275 100644
+index 3768298..1ce92da 100644
 --- a/connito/shared/dataloader.py
 +++ b/connito/shared/dataloader.py
-@@ -541,6 +541,26 @@ def get_dataloader(
+@@ -541,7 +541,48 @@ def get_dataloader(
      world_size = world_size if world_size is not None else config.task.exp.data.world_size
      rank = rank if rank is not None else config.task.exp.data.rank
  
@@ -27,5 +27,27 @@ index 3768298..68a2275 100644
 +            logger.info("train rank overridden from CONNITO_DATA_RANK", rank=rank, world_size=world_size)
 +
      dataset_class_path = getattr(config.task.exp.data, "dataset_class", None)
++
++    # LOCAL PATCH (ops/): per-miner dataset source.
++    #
++    # `dataset_class` lives in the shared expert-group config, so both miners
++    # get whatever it says and a local-vs-streaming A/B is impossible -- the
++    # same problem `rank` has, and for the same reason (`_update_by_task`
++    # rebuilds task.exp from the group file, discarding per-uid values).
++    #
++    # CONNITO_DATASET_CLASS overrides it per process:
++    #     "default" / "stream" / ""  -> DefaultStreamingTorchDataset (stream HF)
++    #     "pkg.mod:Class"            -> that class
++    # unset                          -> whatever the group config says
++    _env_ds = os.environ.get("CONNITO_DATASET_CLASS")
++    if _env_ds is not None:
++        if _env_ds.strip().lower() in ("", "default", "stream", "streaming", "none"):
++            dataset_class_path = None
++        else:
++            dataset_class_path = _env_ds.strip()
++        logger.info("dataset_class overridden from CONNITO_DATASET_CLASS",
++                    dataset_class=dataset_class_path or "DefaultStreamingTorchDataset")
++
      if dataset_class_path is None:
          DatasetCls = DefaultStreamingTorchDataset
+     else:
