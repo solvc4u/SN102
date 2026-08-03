@@ -40,10 +40,15 @@ mkdir -p "$LOG_DIR"
 # data_rank shards the TRAINING stream via split_dataset_by_node over
 # world_size 10 (see the CONNITO_DATA_RANK patch in shared/dataloader.py).
 #
-# All three share rank 2 ON PURPOSE. The point of running three miners is to
-# compare learning rates, and that comparison is only readable if the training
-# data is held constant -- different ranks meant every LR result was confounded
-# by a different slice of the stream.
+# Two-factor design with 250 as the shared control, so each comparison moves
+# exactly one variable:
+#
+#   250 vs 178   same rank 2, different LR    -> isolates LEARNING RATE
+#   250 vs 121   same LR, different rank      -> isolates TRAINING DATA
+#
+# Reading either one requires the other factor held constant, which is why the
+# seed is identical everywhere as well: it permutes shard order, so a per-uid
+# seed would reintroduce a data difference even at a matching rank.
 #
 # Still NOT rank 1: the stock `expert_groups/*/config.yaml` ships `rank: 1`, so
 # the whole default field trains that slice, and a miner whose val_loss lands
@@ -57,7 +62,7 @@ mkdir -p "$LOG_DIR"
 MINERS=(
   "250:0:HOTKEY_UID250:HF_TOKEN_UID250:PROXY_UID250:3303:2"
   "178:2:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:3303:2"
-  "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:3303:2"
+  "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:3303:8"
 )
 
 # uids started by a bare `start`. 121 is a candidate and stays out until 250
