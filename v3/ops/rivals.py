@@ -340,12 +340,94 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def _our_config(uid: int) -> dict:
+    """What this uid is actually configured to do, read from the files that drive it."""
+    ops = Path("/root/SN102/ops")
+    lr_file = ops / f"lr_override_{uid}.json"
+    if not lr_file.exists():
+        lr_file = ops / "lr_override.json"
+    lr = {}
+    try:
+        lr = json.loads(lr_file.read_text())
+    except Exception:  # noqa: BLE001
+        pass
+    ds_file = ops / f"dataset_{uid}.txt"
+    ds = ds_file.read_text().strip() if ds_file.exists() else "(group config)"
+    if ds in ("default", "stream", "streaming", "none"):
+        ds = "HF streaming"
+    return {"peak_lr": lr.get("peak_lr"), "floor": lr.get("min_frac"),
+            "dataset": ds, "lr_file": lr_file.name}
+
+
+def cmd_versus(args) -> int:
+    """Side-by-side: our miners against the earners and the val_loss leaders.
+
+    The point is to make the two questions separable at a glance -- are we
+    losing on LOSS, or on COHORT? They are different problems with different
+    fixes, and the leaderboard routinely has the best-loss miner earning zero.
+    """
+    data = fetch_leaderboard()
+    base = (data.get("round") or {}).get("baseline_loss")
+    ph = data.get("phase") or {}
+    meta = data.get("meta") or {}
+    rows = rows_from(data)
+    lb = data["leaderboard"]
+    lb = lb if isinstance(lb, list) else list(lb.values())
+    detail = {m["uid"]: _val_loss_detail(m) for m in lb}
+
+    print(f"cycle={ph.get('cycle_index')} phase={ph.get('name')} baseline={base}")
+    if meta:
+        print(f"validators: {meta.get('polled_validator_count')}/{meta.get('validator_count')} polled, "
+              f"contributing={meta.get('contributing_validators')}"
+              f"{'  STALE: ' + str(meta.get('stale_reason')) if meta.get('stale') else ''}")
+
+    scored = sorted([r for r in rows if r["val_loss"] is not None], key=lambda r: r["val_loss"])
+    earners = sorted([r for r in rows if r["incentive"] > 0], key=lambda r: -r["incentive"])
+
+    print(f"\n=== OURS ===")
+    for uid in sorted(OUR_UIDS):
+        r = next((x for x in rows if x["uid"] == uid), None)
+        if r is None:
+            continue
+        cfg = _our_config(uid)
+        rank = next((i for i, x in enumerate(scored, 1) if x["uid"] == uid), None)
+        vl = f"{r['val_loss']:.4f}" if r["val_loss"] is not None else "-"
+        dl = f"{base - r['val_loss']:+.4f}" if (base and r["val_loss"] is not None) else "-"
+        print(f"  uid {uid}: val_loss={vl:<9} delta={dl:<9} rank={rank}/{len(scored)} "
+              f"cohort={r['cohort']} inc={r['incentive']:.5f}")
+        print(f"           lr={cfg['peak_lr']} floor={cfg['floor']} data={cfg['dataset']}")
+        if detail.get(uid):
+            print(f"           {'  '.join(detail[uid])}")
+
+    print(f"\n=== EARNERS ({len(earners)}) -- what it takes to be paid ===")
+    for r in earners[:6]:
+        vl = f"{r['val_loss']:.4f}" if r["val_loss"] is not None else "-"
+        print(f"  uid {r['uid']:<5} inc={r['incentive']:.5f} cohort={str(r['cohort']):<6} "
+              f"val_loss={vl:<9} {r['repo'] or '-'}")
+
+    print(f"\n=== BEST LOSS (top {args.top}) -- note how many earn nothing ===")
+    for i, r in enumerate(scored[: args.top], 1):
+        print(f"  {i:>3}. uid {r['uid']:<5} {r['val_loss']:.4f}  cohort={str(r['cohort']):<6} "
+              f"inc={r['incentive']:.4f}  {r['repo'] or '-'}")
+
+    if earners:
+        e_losses = [r["val_loss"] for r in earners if r["val_loss"] is not None]
+        ours = [r["val_loss"] for r in rows if r["uid"] in OUR_UIDS and r["val_loss"] is not None]
+        if e_losses and ours:
+            print(f"\ngap to the worst-scoring EARNER: {min(ours) - max(e_losses):+.4f}")
+            print("  (positive = we must improve loss; negative = loss is fine, cohort is the blocker)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("snapshot", help="append current leaderboard to the JSONL")
     sub.add_parser("history", help="trajectories, cohort moves, who earns")
+
+    v = sub.add_parser("versus", help="our miners vs earners and loss leaders")
+    v.add_argument("--top", type=int, default=8)
 
     c = sub.add_parser("compare", help="tensor-level diff against top miners")
     c.add_argument("--top", type=int, default=3)
@@ -354,7 +436,8 @@ def main() -> int:
     c.add_argument("--layers", action="store_true", help="per-layer breakdown")
 
     args = ap.parse_args()
-    return {"snapshot": cmd_snapshot, "history": cmd_history, "compare": cmd_compare}[args.cmd](args)
+    return {"snapshot": cmd_snapshot, "history": cmd_history,
+            "versus": cmd_versus, "compare": cmd_compare}[args.cmd](args)
 
 
 if __name__ == "__main__":
