@@ -1,29 +1,28 @@
 diff --git a/expert_groups/exp_nemotron_c4/config.yaml b/expert_groups/exp_nemotron_c4/config.yaml
-index 3c4db11..0b11b54 100644
+index 3c4db11..5f4d7dd 100644
 --- a/expert_groups/exp_nemotron_c4/config.yaml
 +++ b/expert_groups/exp_nemotron_c4/config.yaml
-@@ -30,12 +30,32 @@ data:
+@@ -30,12 +30,31 @@ data:
    world_size: 10 # TODO: approximately how many miners are out there
    rank: 1 # TODO: based on your uid
  
 -  # NOTE: `dataset_class` is deliberately NOT set. Leaving it unset resolves to
-+  # LOCAL PATCH (ops/): read the corpus from disk instead of streaming from HF.
++  # LOCAL CORPUS — kept. Validator evidence, 2026-08-03:
++  #     uid 178 (local, 1.2e-5): 2.5476 -> 2.3715   improved
++  #     uid 250 (streaming, 3e-5): 2.7424           worse
 +  #
-+  # The upstream note below is right that pointing `dataset_class` at
-+  # `expert_groups/exp_math/dataset.py` would silently drop the
-+  # anti-memorization fix, because that class prefix-truncates. Our
-+  # `LocalSharedDataset.tokenize_and_format` does NOT reimplement tokenization —
-+  # it delegates to `connito.shared.dataloader.tokenize_windowed`, the same
-+  # function `DefaultStreamingTorchDataset` calls, so the windowing behaviour is
-+  # identical by construction rather than by copy. Verified byte-identical
-+  # output on short, long and empty documents.
++  # An earlier revert was nearly made on the basis of 178's LOCAL eval jumping
++  # 2.52 -> 3.33. That comparison was invalid: setting `dataset_class` also moves
++  # the EVAL split onto the local corpus, so the two numbers were measured on
++  # different distributions. Only the validator's seeded slice scores, and by
++  # that measure local is our best configuration so far.
 +  #
-+  # Why local at all: streaming from HF wedges the trainer. uid 178 died twice
-+  # on 2026-08-01/02 at "used up train dataloader, rebuilding for next epoch",
-+  # hanging on an HF request with no timeout — 4.6 hours the first time. Each
-+  # death resets inner_opt_step and discards accumulated training, which is what
-+  # has kept our val_loss ~1.0 above the miners who train uninterrupted. The
-+  # corpus is 4M rows per source, matching the 50/50 weights, pinned revisions.
++  # Known defect, still worth fixing: ops/fetch_corpus.py takes rows
++  # head-of-stream, so 4M rows cover only ~11 of c4's 1024 source shards (~1%),
++  # while `eval_source_seeded_shard_pick` draws uniformly from all of them. Same
++  # bias that produced a 93% Czech/Bulgarian legal corpus; ops/fetch_legal_native.py
++  # fixes it with per-shard quotas. Rebuilding the corpus that way should widen
++  # coverage without giving up the stability that is currently winning.
 +  #
 +  # ORIGINAL UPSTREAM NOTE:
 +  # `dataset_class` is deliberately NOT set. Leaving it unset resolves to
