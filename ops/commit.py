@@ -133,6 +133,83 @@ def install_upload_retry() -> None:
 EVAL_LOG_NAME = "local_eval.json"
 
 
+def install_repo_squash() -> None:
+    """Collapse the checkpoint repo's history before each upload.
+
+    Every operator currently earning keeps exactly TWO commits in the repo it
+    publishes from -- an "initial commit" a minute before each "miner
+    submission" -- while the two operators that let history accumulate earn
+    nothing:
+
+        Attila115      9 repos, each commits=2 submissions=1   EARNS
+        Infinite3214   8 repos, each commits=2 submissions=1   EARNS
+        athena2634     coho00001 commits=52 submissions=51     earns 0
+        us             co2       commits=106 submissions=103   earns 0
+
+    athena2634 holds the four best val_loss on the subnet (1.4418) and is paid
+    nothing, which loss cannot explain. Each submission is a 3.3 GB LFS object,
+    so co2 carries ~340 GB of history; a validator resolving one revision out of
+    that inside a bounded phase window is doing very different work than
+    fetching a repo with a single file. That would explain what nothing else
+    has: slot5 reporting no_chain_commit for every one of our uids every round,
+    only 1 of 2 live validators ever scoring us, and 5-6 distinct val_loss
+    values across 10 cycles.
+
+    Squashing rather than renaming, because the repo id is written to the chain
+    commit and must stay stable for the uid.
+
+    ORDER IS LOAD-BEARING. The chain commit records a specific revision SHA, and
+    validators fetch exactly that. Squashing AFTER a submission would delete the
+    SHA the chain points at and guarantee the failure we are trying to fix. So
+    the squash runs BEFORE the upload: history collapses to one commit, the new
+    checkpoint lands on top as a second, and the SHA the chain advertises is
+    always the newest and always present. Steady state is commits=2, matching
+    what the earners show.
+
+    Never raises: this is on the submission path, and a squash failure must
+    degrade to "upload anyway with history intact", not forfeit the round.
+    """
+    import connito.miner.model_io as mio
+
+    upload = mio.upload_checkpoint_to_hf  # already wrapped by install_upload_retry
+    uid = os.environ.get("CONNITO_UID", "")
+    path = os.environ.get(
+        "CONNITO_HF_REPO_OVERRIDE", f"/root/SN102/ops/hf_repo_{uid}.json")
+
+    def _enabled() -> bool:
+        try:
+            with open(path) as fh:
+                return bool(json.load(fh).get("squash_before_upload"))
+        except Exception:  # noqa: BLE001 - missing or malformed -> off
+            return False
+
+    def squashing_upload(*args, **kwargs):
+        repo_id = kwargs.get("repo_id")
+        if repo_id is None:
+            # positional: upload_checkpoint_to_hf(ckpt_dir, repo_id, ...)
+            repo_id = args[1] if len(args) > 1 else None
+        if repo_id and _enabled():
+            try:
+                from huggingface_hub import HfApi
+                tok = (kwargs.get("token")
+                       or os.environ.get(kwargs.get("token_env_var") or "HF_TOKEN")
+                       or os.environ.get("HF_TOKEN"))
+                api = HfApi(token=tok)
+                api.create_repo(repo_id=repo_id, exist_ok=True, private=False)
+                api.super_squash_history(
+                    repo_id=repo_id,
+                    commit_message="reset history before submission")
+                print(f"[commit] squashed history for {repo_id} before upload", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[commit] squash skipped for {repo_id} "
+                      f"({type(exc).__name__}: {str(exc)[:120]}) -- uploading anyway",
+                      flush=True)
+        return upload(*args, **kwargs)
+
+    mio.upload_checkpoint_to_hf = squashing_upload
+    print(f"[commit] repo squash installed (watching {path})", flush=True)
+
+
 def install_repo_override() -> None:
     """Let the HF upload repo be changed WITHOUT restarting the miner.
 
@@ -145,18 +222,11 @@ def install_repo_override() -> None:
 
     Control file, re-read on EVERY submission:  ops/hf_repo_<uid>.json
 
-        {"repo": "solvc4u/co-250-a"}          pin to one repo
-        {"mode": "rotate",
-         "prefix": "solvc4u/co-250-"}          fresh repo per submission
+        {"repo": "solvc4u/co-250"}            publish here instead of the config
 
-    Rotation exists because of what the leaderboard shows: every operator
-    currently earning (Attila115, Infinite3214) publishes ONE submission per
-    repo and then moves on, while both operators that append to a long-lived
-    repo earn nothing -- athena2634 holds the four best val_loss on the subnet
-    (1.4418) and is paid zero, and our own co2 carries 103 submissions. A
-    validator fetching a revision out of ~340 GB of LFS history inside a bounded
-    phase window is doing very different work than fetching a repo with one
-    file. Unproven as a mechanism, cheap to test.
+    The repo id is what goes on chain, so it stays ONE stable name per uid --
+    see install_repo_squash() for the history problem, which is handled by
+    resetting the repo rather than by changing its name.
 
     Missing or malformed file -> stock behaviour, never an exception: this runs
     on the submission path and a crash here forfeits the round.
@@ -179,13 +249,6 @@ def install_repo_override() -> None:
             return orig(hf_cfg, *a, **kw)
 
         repo = ov.get("repo")
-        if not repo and ov.get("mode") == "rotate":
-            prefix = ov.get("prefix") or ""
-            if prefix:
-                # Suffix must be unique per submission and identical in the
-                # chain commit, so derive it from the clock rather than a
-                # counter that a restart would reset.
-                repo = f"{prefix}{time.strftime('%m%d%H%M', time.gmtime())}"
         if not repo:
             return orig(hf_cfg, *a, **kw)
 
@@ -316,6 +379,7 @@ def main() -> int:
     install_upload_retry()
     install_best_checkpoint_selection()
     install_repo_override()
+    install_repo_squash()
 
     args = parse_args()
     config = (
