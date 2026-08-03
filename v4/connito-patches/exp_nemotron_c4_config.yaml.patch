@@ -1,0 +1,38 @@
+diff --git a/expert_groups/exp_nemotron_c4/config.yaml b/expert_groups/exp_nemotron_c4/config.yaml
+index 3c4db11..0b11b54 100644
+--- a/expert_groups/exp_nemotron_c4/config.yaml
++++ b/expert_groups/exp_nemotron_c4/config.yaml
+@@ -30,12 +30,32 @@ data:
+   world_size: 10 # TODO: approximately how many miners are out there
+   rank: 1 # TODO: based on your uid
+ 
+-  # NOTE: `dataset_class` is deliberately NOT set. Leaving it unset resolves to
++  # LOCAL PATCH (ops/): read the corpus from disk instead of streaming from HF.
++  #
++  # The upstream note below is right that pointing `dataset_class` at
++  # `expert_groups/exp_math/dataset.py` would silently drop the
++  # anti-memorization fix, because that class prefix-truncates. Our
++  # `LocalSharedDataset.tokenize_and_format` does NOT reimplement tokenization —
++  # it delegates to `connito.shared.dataloader.tokenize_windowed`, the same
++  # function `DefaultStreamingTorchDataset` calls, so the windowing behaviour is
++  # identical by construction rather than by copy. Verified byte-identical
++  # output on short, long and empty documents.
++  #
++  # Why local at all: streaming from HF wedges the trainer. uid 178 died twice
++  # on 2026-08-01/02 at "used up train dataloader, rebuilding for next epoch",
++  # hanging on an HF request with no timeout — 4.6 hours the first time. Each
++  # death resets inner_opt_step and discards accumulated training, which is what
++  # has kept our val_loss ~1.0 above the miners who train uninterrupted. The
++  # corpus is 4M rows per source, matching the 50/50 weights, pinned revisions.
++  #
++  # ORIGINAL UPSTREAM NOTE:
++  # `dataset_class` is deliberately NOT set. Leaving it unset resolves to
+   # `DefaultStreamingTorchDataset`, whose `tokenize_and_format` delegates to
+   # `connito.shared.dataloader.tokenize_windowed` — long documents contribute a
+   # content-hash-derived window instead of always their (most templated) prefix.
+   # `expert_groups/exp_math/dataset.py` still prefix-truncates, so pointing at it
+   # would silently drop that anti-memorization fix.
++  dataset_class: "ops.shared_dataset:LocalSharedDataset"
+ 
+   # Whole-shard eval reach: seed picks the shard AND the in-shard offset, so
+   # across rotating seeds every shard and every row is eventually reachable.

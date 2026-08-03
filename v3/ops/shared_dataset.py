@@ -166,18 +166,25 @@ class LocalSharedDataset(DefaultStreamingTorchDataset):
         tokenizer: PreTrainedTokenizerBase,
         sequence_length: int,
     ) -> dict[str, Any]:
-        # Byte-for-byte the stock exp_math behaviour. Do not "improve" this:
-        # any divergence from how the validator tokenises its eval slice shows
-        # up as a systematically worse val_loss.
-        text = str(example.get("text", ""))
-        toks = tokenizer(
-            text,
-            truncation=True,
-            max_length=sequence_length,
-            padding="max_length",
-            add_special_tokens=True,
+        # Delegate to upstream `tokenize_windowed` -- the same function
+        # `DefaultStreamingTorchDataset` uses. Do not reimplement it here: any
+        # divergence from how the validator tokenises its eval slice shows up
+        # as a systematically worse val_loss, and a local copy would drift the
+        # first time upstream touched it.
+        #
+        # This replaces the old prefix-truncating path copied from
+        # `expert_groups/exp_math/dataset.py`. That path always trained on a
+        # document's FIRST sequence_length tokens, which for templated corpora
+        # is the most boilerplate-heavy region -- document bodies never entered
+        # the pipeline. exp_nemotron_c4 deliberately leaves `dataset_class`
+        # unset upstream to get the windowed behaviour, so a local dataset that
+        # prefix-truncates would silently give up the anti-memorization
+        # property in exchange for avoiding HF streaming.
+        from connito.shared.dataloader import tokenize_windowed
+
+        return tokenize_windowed(
+            str(example.get("text", "")), tokenizer, sequence_length
         )
-        return {"input_ids": toks["input_ids"], "attention_mask": toks["attention_mask"]}
 
     @classmethod
     def get_tokenised_dataset(
