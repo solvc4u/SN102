@@ -419,12 +419,79 @@ def cmd_versus(args) -> int:
     return 0
 
 
+# 250 is the shared control; each pair moves exactly one variable.
+FACTORS = {
+    "LEARNING RATE": (250, 178, "same rank 2, LR 3e-5 vs 5e-5"),
+    "TRAINING DATA": (250, 121, "same LR 3e-5, rank 2 vs 8"),
+}
+
+
+def cmd_factors(args) -> int:
+    """Which matters more here, the learning rate or the training data?
+
+    Reads the two-factor design directly: each pair differs in ONE thing, so the
+    score gap within a pair is that thing's effect. Comparing the two gaps says
+    which lever is worth pulling.
+
+    Every number is the validator's, from the same endpoint the dashboard UI
+    uses. Local eval is deliberately not used: it moves with the miner's own
+    eval split (switching dataset_class silently moves it), and reading it as if
+    it were comparable drove two wrong config changes earlier.
+    """
+    data = fetch_leaderboard()
+    base = (data.get("round") or {}).get("baseline_loss")
+    ph = data.get("phase") or {}
+    rows = {r["uid"]: r for r in rows_from(data)}
+    lb = data["leaderboard"]
+    lb = lb if isinstance(lb, list) else list(lb.values())
+    detail = {m["uid"]: _val_loss_detail(m) for m in lb}
+
+    print(f"cycle={ph.get('cycle_index')} phase={ph.get('name')} baseline={base}\n")
+    print("=== the three arms ===")
+    for uid in (250, 178, 121):
+        r = rows.get(uid) or {}
+        cfg = _our_config(uid)
+        vl = r.get("val_loss")
+        print(f"  uid {uid}: val_loss={('%.4f' % vl) if vl is not None else 'not scored yet':<16}"
+              f"cohort={str(r.get('cohort')):<6} lr={cfg['peak_lr']}")
+        if detail.get(uid):
+            print(f"           {'  '.join(detail[uid])}")
+
+    print("\n=== effect of each factor ===")
+    verdict = {}
+    for name, (a, b, how) in FACTORS.items():
+        va, vb = (rows.get(a) or {}).get("val_loss"), (rows.get(b) or {}).get("val_loss")
+        if va is None or vb is None:
+            missing = a if va is None else b
+            print(f"  {name:<15} pending -- uid {missing} has no validator score yet")
+            continue
+        gap = vb - va
+        verdict[name] = abs(gap)
+        better = b if gap < 0 else a
+        print(f"  {name:<15} {how}")
+        print(f"  {'':<15} uid {a}={va:.4f}  uid {b}={vb:.4f}  gap={gap:+.4f}  -> uid {better} better")
+
+    if len(verdict) == 2:
+        ranked = sorted(verdict.items(), key=lambda kv: -kv[1])
+        (top, tv), (low, lv) = ranked
+        print(f"\n  {top} moves val_loss {tv:.4f}; {low} moves it {lv:.4f}.")
+        if lv > 0 and tv / lv >= 1.5:
+            print(f"  -> {top} is the lever that matters here; tune that first.")
+        else:
+            print("  -> comparable so far; one scored round each is not enough to separate them.")
+    else:
+        print("\n  (both factors need a scored round on each arm before this can be read)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("snapshot", help="append current leaderboard to the JSONL")
     sub.add_parser("history", help="trajectories, cohort moves, who earns")
+
+    sub.add_parser("factors", help="is rank or LR the lever? reads the two-factor design")
 
     v = sub.add_parser("versus", help="our miners vs earners and loss leaders")
     v.add_argument("--top", type=int, default=8)
@@ -437,7 +504,8 @@ def main() -> int:
 
     args = ap.parse_args()
     return {"snapshot": cmd_snapshot, "history": cmd_history,
-            "versus": cmd_versus, "compare": cmd_compare}[args.cmd](args)
+            "versus": cmd_versus, "compare": cmd_compare,
+            "factors": cmd_factors}[args.cmd](args)
 
 
 if __name__ == "__main__":
