@@ -41,6 +41,7 @@ just wastes the window.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
@@ -130,6 +131,80 @@ def install_upload_retry() -> None:
 
 
 EVAL_LOG_NAME = "local_eval.json"
+
+
+def install_repo_override() -> None:
+    """Let the HF upload repo be changed WITHOUT restarting the miner.
+
+    `config.hf.checkpoint_repo` is read once at process start, so changing where
+    we publish used to cost a restart -- and a restart near MinerCommit costs the
+    round. `resolve_hf_repo_ids` is called inside `_upload_checkpoint_to_hf_safe`
+    on every submission, so wrapping it there gives a value that can change
+    between cycles with the miner still running. Same principle as
+    ops/lr_override.json and the corpus hot-swap.
+
+    Control file, re-read on EVERY submission:  ops/hf_repo_<uid>.json
+
+        {"repo": "solvc4u/co-250-a"}          pin to one repo
+        {"mode": "rotate",
+         "prefix": "solvc4u/co-250-"}          fresh repo per submission
+
+    Rotation exists because of what the leaderboard shows: every operator
+    currently earning (Attila115, Infinite3214) publishes ONE submission per
+    repo and then moves on, while both operators that append to a long-lived
+    repo earn nothing -- athena2634 holds the four best val_loss on the subnet
+    (1.4418) and is paid zero, and our own co2 carries 103 submissions. A
+    validator fetching a revision out of ~340 GB of LFS history inside a bounded
+    phase window is doing very different work than fetching a repo with one
+    file. Unproven as a mechanism, cheap to test.
+
+    Missing or malformed file -> stock behaviour, never an exception: this runs
+    on the submission path and a crash here forfeits the round.
+    """
+    from connito.miner import model_io
+
+    orig = model_io.resolve_hf_repo_ids
+    uid = os.environ.get("CONNITO_UID", "")
+    path = os.environ.get(
+        "CONNITO_HF_REPO_OVERRIDE", f"/root/SN102/ops/hf_repo_{uid}.json")
+
+    def patched(hf_cfg, *a, **kw):
+        try:
+            with open(path) as fh:
+                ov = json.load(fh)
+        except FileNotFoundError:
+            return orig(hf_cfg, *a, **kw)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[commit] ignoring bad repo override ({exc})", flush=True)
+            return orig(hf_cfg, *a, **kw)
+
+        repo = ov.get("repo")
+        if not repo and ov.get("mode") == "rotate":
+            prefix = ov.get("prefix") or ""
+            if prefix:
+                # Suffix must be unique per submission and identical in the
+                # chain commit, so derive it from the clock rather than a
+                # counter that a restart would reset.
+                repo = f"{prefix}{time.strftime('%m%d%H%M', time.gmtime())}"
+        if not repo:
+            return orig(hf_cfg, *a, **kw)
+
+        # Route through the stock resolver so the chain-payload length check
+        # and advertised-repo derivation still apply to the new value.
+        try:
+            hf_cfg = hf_cfg.model_copy(update={"checkpoint_repo": repo})
+        except Exception:  # noqa: BLE001 - not a pydantic model
+            try:
+                hf_cfg.checkpoint_repo = repo
+            except Exception as exc:  # noqa: BLE001
+                print(f"[commit] cannot apply repo override ({exc})", flush=True)
+                return orig(hf_cfg, *a, **kw)
+        up, chain = orig(hf_cfg, *a, **kw)
+        print(f"[commit] repo override -> upload={up} chain={chain}", flush=True)
+        return up, chain
+
+    model_io.resolve_hf_repo_ids = patched
+    print(f"[commit] repo override installed (watching {path})", flush=True)
 
 
 def install_best_checkpoint_selection() -> None:
@@ -240,6 +315,7 @@ def main() -> int:
 
     install_upload_retry()
     install_best_checkpoint_selection()
+    install_repo_override()
 
     args = parse_args()
     config = (
