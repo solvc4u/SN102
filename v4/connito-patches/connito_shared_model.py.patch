@@ -1,5 +1,5 @@
 diff --git a/connito/shared/model.py b/connito/shared/model.py
-index 8e930e9..fb62b87 100644
+index 8e930e9..8e9b3cc 100644
 --- a/connito/shared/model.py
 +++ b/connito/shared/model.py
 @@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
@@ -50,7 +50,62 @@ index 8e930e9..fb62b87 100644
          elif expert_group_id == "shared":
              # `model_shared` is no longer persisted or distributed; backbone state
              # is reconstructed from `config.model.model_path` at instantiation.
-@@ -390,11 +406,6 @@ def fetch_model_from_chain_validator(
+@@ -365,6 +381,54 @@ def fetch_model_from_chain_validator(
+             checkpoints=[ckpt for ckpt in chain_checkpoints.checkpoints if ckpt > current_model_meta]
+         )
+ 
++    # LOCAL PATCH (ops/): prefer a validator that is actually publishing OUR
++    # expert group, ranked by stake.
++    #
++    # Candidates arrive ordered by `global_ver`, and on 2026-08-03 that picked
++    # the wrong validator every single cycle:
++    #
++    #   uid 0   Owner  70.9% stake  e=4  v=0        g-connito/co  serving
++    #   uid 108 Rizzo   0.5% stake  e=3  v=8766356  rizzo2/cyc    not serving
++    #
++    # Owner stamps v=0 (validator/run.py:1937 zeroes global_ver when it did not
++    # participate in the merge), so a version-ranked chooser always loses to
++    # Rizzo -- a 0.5%-stake validator publishing a DIFFERENT expert group, whose
++    # repo therefore has no model_expgroup_4 file at all. Every Distribute ended:
++    #
++    #   HFFileMissingError: no checkpoint shard at rizzo2/cyc@... for
++    #   ('.safetensors', '.pt') -> All download attempts failed after 2 retries
++    #
++    # while the phase still logged "completed on time", so it read as healthy.
++    #
++    # Filtering by expert group is the correctness fix (a group-3 checkpoint can
++    # never satisfy a group-4 task); stake ordering is what the reference miner
++    # does -- read the validator commits and pick by majority stake. Falls back
++    # to the unfiltered list if nothing matches, so a subnet-wide group change
++    # cannot strand us with zero candidates.
++    _want_group = getattr(config.task.exp, "group_id", None)
++    if _want_group is not None and len(chain_checkpoints.checkpoints) > 1:
++        _matching = [c for c in chain_checkpoints.checkpoints
++                     if c.expert_group is None or c.expert_group == _want_group]
++        if _matching:
++            _matching.sort(key=lambda c: (c.stake or 0.0), reverse=True)
++            if [c.hotkey for c in _matching] != [c.hotkey for c in chain_checkpoints.checkpoints]:
++                logger.info(
++                    "chain checkpoint candidates re-ranked by expert group + stake",
++                    want_group=_want_group,
++                    chose_uid=_matching[0].uid,
++                    chose_repo=_matching[0].hf_repo_id,
++                    chose_stake=_matching[0].stake,
++                    dropped=[(c.uid, c.expert_group) for c in chain_checkpoints.checkpoints
++                             if c not in _matching],
++                )
++            chain_checkpoints = ChainCheckpoints(checkpoints=_matching)
++        else:
++            logger.warning(
++                "no chain checkpoint matches our expert group; using unfiltered list",
++                want_group=_want_group,
++                available=[(c.uid, c.expert_group) for c in chain_checkpoints.checkpoints],
++            )
++
+     should_download = len(chain_checkpoints.checkpoints) > 0
+ 
+     logger.info(
+@@ -390,11 +454,6 @@ def fetch_model_from_chain_validator(
                  )
                  out_folder.mkdir(parents=True, exist_ok=True)
  
@@ -62,7 +117,7 @@ index 8e930e9..fb62b87 100644
                  if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
                      logger.warning(
                          "Chain checkpoint missing HF coordinates; skipping",
-@@ -403,16 +414,50 @@ def fetch_model_from_chain_validator(
+@@ -403,16 +462,50 @@ def fetch_model_from_chain_validator(
                      )
                      continue
  
