@@ -80,6 +80,25 @@ def cmd_lr(uid: int, value: str) -> int:
     return 0
 
 
+def cmd_startlr(uid: int, value: str) -> int:
+    """Where this uid's LR search begins before it has a scored round.
+
+    Read at process start (it is an env var), so unlike `lr` this one needs a
+    restart to change -- and it only matters until the first scored round, after
+    which the tuner takes over regardless.
+    """
+    path = OPS / f"start_lr_{uid}.txt"
+    if value in ("clear", "default", "none"):
+        path.unlink(missing_ok=True)
+        print(f"  uid {uid}: start LR cleared (falls back to CONNITO_START_LR)")
+    else:
+        float(value)  # reject typos before they reach a miner
+        _write(path, value)
+        print(f"  uid {uid}: LR search will start at {value}")
+    print("  (read at process start -- applies on next start/restart)")
+    return 0
+
+
 def cmd_show(*_a) -> int:
     for uid in UIDS:
         lr_file = OPS / f"lr_override_{uid}.json"
@@ -103,7 +122,9 @@ def cmd_show(*_a) -> int:
             repo = f"{r.get('repo') or '(config)'}" + (" +squash" if r.get("squash_before_upload") else "")
         else:
             repo = "(config)"
-        print(f"  uid {uid}:  lr={lr:<18} data={ds:<34} repo={repo}")
+        sl_file = OPS / f"start_lr_{uid}.txt"
+        sl = sl_file.read_text().strip() if sl_file.exists() else "-"
+        print(f"  uid {uid}:  lr={lr:<18} start={sl:<8} data={ds:<24} repo={repo}")
     return 0
 
 
@@ -111,7 +132,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("show", help="current settings for every uid")
-    for name, helptext in (("repo", "publish target"), ("data", "training source"), ("lr", "learning rate")):
+    for name, helptext in (("repo", "publish target"), ("data", "training source"),
+                           ("lr", "learning rate"), ("startlr", "initial LR for the tuner")):
         p = sub.add_parser(name, help=helptext)
         p.add_argument("uid", type=int)
         p.add_argument("value")
@@ -121,7 +143,8 @@ def main() -> int:
     if a.uid not in UIDS:
         print(f"unknown uid {a.uid}; expected one of {UIDS}", file=sys.stderr)
         return 1
-    return {"repo": cmd_repo, "data": cmd_data, "lr": cmd_lr}[a.cmd](a.uid, a.value)
+    return {"repo": cmd_repo, "data": cmd_data, "lr": cmd_lr,
+            "startlr": cmd_startlr}[a.cmd](a.uid, a.value)
 
 
 if __name__ == "__main__":

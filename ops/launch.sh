@@ -46,7 +46,7 @@ mkdir -p "$LOG_DIR"
 # duplicate heuristic, so distinct data is a precondition for scoring at all.
 MINERS=(
   "250:0:HOTKEY_UID250:HF_TOKEN_UID250:PROXY_UID250:3303:2"
-  "178:1:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:2202:7"
+  "178:2:HOTKEY_UID178:HF_TOKEN_UID178:PROXY_UID178:2202:7"
   "121:1:HOTKEY_UID121:HF_TOKEN_UID121:PROXY_UID121:1101:8"
 )
 
@@ -168,6 +168,11 @@ start_one() {
     ${FORCE_MIN_FRAC:+"CONNITO_FORCE_MIN_FRAC=$FORCE_MIN_FRAC"}
     ${CKPT_SELECT:+"CONNITO_CKPT_SELECT=$CKPT_SELECT"}
     "TUNER_DB=$TUNER_DB"
+    # Where THIS uid's LR search starts before it has a scored round. Lets each
+    # miner explore from a different point instead of all three converging from
+    # the same seed, which would waste the parallelism. Written by
+    # `ops.setcfg startlr <uid> <value>`; falls back to CONNITO_START_LR.
+    $(f="$OPS_ROOT/start_lr_$uid.txt"; [[ -f "$f" ]] && echo "CONNITO_START_LR=$(tr -d '\n' < "$f")")
     # Per-uid LR override if ops/lr_override_<uid>.json exists, else the shared
     # file. autolr re-reads whichever path this points at on every cycle
     # boundary, so the VALUE stays hot-swappable without a restart -- only
