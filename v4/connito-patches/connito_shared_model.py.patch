@@ -1,5 +1,5 @@
 diff --git a/connito/shared/model.py b/connito/shared/model.py
-index 8e930e9..133effc 100644
+index 8e930e9..f4cd04c 100644
 --- a/connito/shared/model.py
 +++ b/connito/shared/model.py
 @@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
@@ -50,7 +50,7 @@ index 8e930e9..133effc 100644
          elif expert_group_id == "shared":
              # `model_shared` is no longer persisted or distributed; backbone state
              # is reconstructed from `config.model.model_path` at instantiation.
-@@ -361,9 +377,96 @@ def fetch_model_from_chain_validator(
+@@ -361,9 +377,112 @@ def fetch_model_from_chain_validator(
  
      # --- Filter to only newer than current model ---
      if current_model_meta is not None:
@@ -142,15 +142,31 @@ index 8e930e9..133effc 100644
 +                )
 +            chain_checkpoints = ChainCheckpoints(checkpoints=_matching)
 +        else:
-+            logger.warning(
-+                "no chain checkpoint matches our expert group; using unfiltered list",
++            # Skip the phase rather than attempt a mismatched checkpoint.
++            #
++            # Falling back to the unfiltered list looks safer and is not: a
++            # group-3 checkpoint can NEVER satisfy a group-4 task, so the
++            # attempt is guaranteed to 404 and its only lasting effect is a
++            # phantom `globalver_<N>/` directory whose name then becomes the
++            # version we advertise on chain.
++            #
++            # This fires whenever the group-4 validator is mid-cycle: during
++            # ValidatorCommit1 it publishes a signature-only commit with no
++            # hf_repo_id, so the completeness gate drops it and Rizzo (group 3,
++            # 0.5% stake) is all that remains. Waiting one phase costs nothing --
++            # we already hold the current checkpoint -- while attempting the
++            # download costs a bogus version label that follows every submission
++            # until the next real download.
++            logger.info(
++                "no chain checkpoint for our expert group this phase; skipping download",
 +                want_group=_want_group,
 +                available=[(c.uid, c.expert_group) for c in chain_checkpoints.checkpoints],
 +            )
++            chain_checkpoints = ChainCheckpoints(checkpoints=[])
  
      should_download = len(chain_checkpoints.checkpoints) > 0
  
-@@ -390,11 +493,6 @@ def fetch_model_from_chain_validator(
+@@ -390,11 +509,6 @@ def fetch_model_from_chain_validator(
                  )
                  out_folder.mkdir(parents=True, exist_ok=True)
  
@@ -162,7 +178,7 @@ index 8e930e9..133effc 100644
                  if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
                      logger.warning(
                          "Chain checkpoint missing HF coordinates; skipping",
-@@ -403,16 +501,50 @@ def fetch_model_from_chain_validator(
+@@ -403,16 +517,50 @@ def fetch_model_from_chain_validator(
                      )
                      continue
  
