@@ -1,5 +1,5 @@
 diff --git a/connito/shared/model.py b/connito/shared/model.py
-index 8e930e9..8e9b3cc 100644
+index 8e930e9..133effc 100644
 --- a/connito/shared/model.py
 +++ b/connito/shared/model.py
 @@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
@@ -50,10 +50,56 @@ index 8e930e9..8e9b3cc 100644
          elif expert_group_id == "shared":
              # `model_shared` is no longer persisted or distributed; backbone state
              # is reconstructed from `config.model.model_path` at instantiation.
-@@ -365,6 +381,54 @@ def fetch_model_from_chain_validator(
-             checkpoints=[ckpt for ckpt in chain_checkpoints.checkpoints if ckpt > current_model_meta]
-         )
+@@ -361,9 +377,96 @@ def fetch_model_from_chain_validator(
  
+     # --- Filter to only newer than current model ---
+     if current_model_meta is not None:
+-        chain_checkpoints = ChainCheckpoints(
+-            checkpoints=[ckpt for ckpt in chain_checkpoints.checkpoints if ckpt > current_model_meta]
+-        )
++        # LOCAL PATCH (ops/): a DIFFERENT advertised revision also counts as new.
++        #
++        # `ckpt > current_model_meta` compares global_ver, and validators stamp
++        # global_ver=0 when they did not participate in the merge
++        # (validator/run.py:1937). Once we hold anything at all, `0 > 8766356` is
++        # false for every candidate and the list empties:
++        #
++        #   Fetching model from chain  chain_checkpoints=ChainCheckpoints(checkpoints=[])
++        #   <Distribute>: No required download job: None
++        #
++        # which is silent -- the phase reports success having downloaded nothing.
++        # We froze at 8766356 while the field moved to 8766840+, one cycle ahead
++        # and widening, because we could never accept another checkpoint again.
++        #
++        # The chain commit's `rv` is the authoritative pointer to THIS cycle's
++        # model; the version number is a label on the bytes, not the selector.
++        # So a candidate whose advertised revision differs from the one we are
++        # holding is downloadable regardless of what its global_ver claims. The
++        # downloaded checkpoint then carries its own real global_ver in metadata.
++        _cur_rev = getattr(current_model_meta, "hf_revision", None)
++
++        def _is_new(ckpt) -> bool:
++            if ckpt > current_model_meta:
++                return True
++            rev = getattr(ckpt, "hf_revision", None)
++            return bool(rev and _cur_rev and rev != _cur_rev)
++
++        _before = len(chain_checkpoints.checkpoints)
++        _kept = [c for c in chain_checkpoints.checkpoints if _is_new(c)]
++        if _kept and not [c for c in chain_checkpoints.checkpoints if c > current_model_meta]:
++            logger.info(
++                "chain checkpoint accepted on revision change despite global_ver",
++                current_rev=_cur_rev,
++                offered=[(c.uid, c.hf_revision, c.global_ver) for c in _kept],
++            )
++        chain_checkpoints = ChainCheckpoints(checkpoints=_kept)
++        if _before and not _kept:
++            logger.info(
++                "no chain checkpoint newer than ours",
++                current_rev=_cur_rev,
++                current_global_ver=getattr(current_model_meta, "global_ver", None),
++            )
++
 +    # LOCAL PATCH (ops/): prefer a validator that is actually publishing OUR
 +    # expert group, ranked by stake.
 +    #
@@ -101,11 +147,10 @@ index 8e930e9..8e9b3cc 100644
 +                want_group=_want_group,
 +                available=[(c.uid, c.expert_group) for c in chain_checkpoints.checkpoints],
 +            )
-+
+ 
      should_download = len(chain_checkpoints.checkpoints) > 0
  
-     logger.info(
-@@ -390,11 +454,6 @@ def fetch_model_from_chain_validator(
+@@ -390,11 +493,6 @@ def fetch_model_from_chain_validator(
                  )
                  out_folder.mkdir(parents=True, exist_ok=True)
  
@@ -117,7 +162,7 @@ index 8e930e9..8e9b3cc 100644
                  if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
                      logger.warning(
                          "Chain checkpoint missing HF coordinates; skipping",
-@@ -403,16 +462,50 @@ def fetch_model_from_chain_validator(
+@@ -403,16 +501,50 @@ def fetch_model_from_chain_validator(
                      )
                      continue
  
