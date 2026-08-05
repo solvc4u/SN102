@@ -417,6 +417,8 @@ class PhaseAwareOneCycle:
         # Same principle that let the corpus hot-swap work without a restart.
         # Optional keys: peak_lr, warmup, min_frac. Malformed file is ignored
         # rather than crashing the miner mid-run.
+        self._apply_grad_accum_override(pos)
+
         forced = os.environ.get("CONNITO_FORCE_LR")
         override_path = os.environ.get(
             "CONNITO_LR_OVERRIDE", "/root/SN102/ops/lr_override.json")
@@ -459,6 +461,69 @@ class PhaseAwareOneCycle:
             f"[autolr] cycle {pos.cycle_index}: peak_lr={self._peak:.2e} "
             f"warmup={self._warmup:.0%} floor={self._min_frac:.0%}"
         )
+
+    def _apply_grad_accum_override(self, pos: PhasePosition) -> None:
+        """Retune gradient accumulation live, without restarting the miner.
+
+        Why this is the knob that matters. The shipped config runs
+        `per_device_train_batch_size: 1` with `gradient_accumulation_steps: 1`,
+        so every optimizer step is estimated from ONE 1024-token document.
+        A gradient from a single document is almost pure noise, and two such
+        estimates from different documents are near-orthogonal by construction
+        -- which is exactly what the weight comparison shows against the miners
+        at the top of the board:
+
+            uid 254 (1.2513)  ||delta|| 248.4  cos(us) +0.018
+            uid 139 (1.2519)  ||delta|| 248.1  cos(us) +0.018
+            per-layer cos +0.02..+0.03 across ALL 26 layers,
+            none aligned (>0.1), none opposed (<-0.1)
+
+        Uniform low cosine on identical architecture, task and data sources is
+        the signature of sampling noise, not of a different objective -- a
+        different objective would show some layers agreeing and others opposing.
+        Learning rate cannot fix it: LR scales how far we step along a noisy
+        direction, which is why sweeping it 23x (3e-6 -> 3e-4) moved ||delta||
+        a great deal and val_loss almost not at all.
+
+        Accumulation costs no extra VRAM -- the micro-batch stays 1, only the
+        number of backwards per optimizer step changes -- so it is safe on cards
+        that already OOM'd at 31.08 GiB with upcast_trainable=True.
+
+        `config.local_par.gradient_accumulation_steps` is read on EVERY step
+        (train.py:368-369), so assigning it here takes effect immediately rather
+        than at the next restart. Control file, re-read each cycle:
+
+            ops/gradaccum_<uid>.json   {"gradient_accumulation_steps": 16}
+
+        Missing or malformed file leaves the configured value untouched.
+        """
+        path = os.environ.get(
+            "CONNITO_GRAD_ACCUM_OVERRIDE",
+            f"/root/SN102/ops/gradaccum_{os.environ.get('CONNITO_UID','')}.json")
+        try:
+            with open(path) as fh:
+                want = int(json.load(fh)["gradient_accumulation_steps"])
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # noqa: BLE001 - never break training on a bad file
+            print(f"[autolr] ignoring bad grad-accum override ({exc})")
+            return
+        if want < 1:
+            return
+        lp = getattr(_CAPTURED_CONFIG, "local_par", None) if _CAPTURED_CONFIG is not None else None
+        if lp is None:
+            return
+        cur = getattr(lp, "gradient_accumulation_steps", None)
+        if cur == want:
+            return
+        try:
+            lp.gradient_accumulation_steps = want
+        except Exception as exc:  # noqa: BLE001 - pydantic may freeze the field
+            print(f"[autolr] cannot apply grad-accum override ({exc})")
+            return
+        print(f"[autolr] cycle {pos.cycle_index}: gradient_accumulation_steps "
+              f"{cur} -> {want} (from {path}); effective batch = "
+              f"{want} x per_device_train_batch_size")
 
     def _lr_for(self, pos: PhasePosition) -> float:
         if pos.name != "Train":
@@ -548,6 +613,14 @@ def install_memory_profile() -> None:
     print("[mem] trainable params kept in bf16 (upcast_trainable=False)")
 
 
+# The live MinerConfig, captured when setup_training first receives it.
+# autolr's main() never sees it -- it is built inside run_distributed_training --
+# but `_apply_grad_accum_override` needs it to retune accumulation without a
+# restart, and train.py reads local_par.gradient_accumulation_steps on every
+# step so a live mutation takes effect immediately.
+_CAPTURED_CONFIG = None
+
+
 EVAL_LOG_NAME = "local_eval.json"
 
 
@@ -612,6 +685,19 @@ def install_eval_recorder() -> None:
 _EVAL_CFG: dict = {}
 
 
+def install_config_capture(train_mod) -> None:
+    """Stash the MinerConfig the moment setup_training receives it."""
+    orig = train_mod.setup_training
+
+    def capturing(config, *a, **kw):
+        global _CAPTURED_CONFIG
+        _CAPTURED_CONFIG = config
+        return orig(config, *a, **kw)
+
+    train_mod.setup_training = capturing
+    print("[autolr] config capture installed (enables live grad-accum retune)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--uid", type=int, default=int(os.environ.get("CONNITO_UID", "0")))
@@ -626,6 +712,7 @@ def main() -> int:
 
     install_memory_profile()
     install_eval_recorder()
+    install_config_capture(train_mod)
 
     if known.no_autolr:
         print("[autolr] disabled; using stock cosine schedule")

@@ -115,9 +115,34 @@ def rows_from(data: dict) -> list[dict]:
     lb = lb if isinstance(lb, list) else list(lb.values())
     out = []
     for m in lb:
+        # Keep the PER-SLOT values, not just the collapsed one.
+        #
+        # Storing a single val_loss threw away the fact that validators
+        # routinely disagree, and by a lot: on 2026-08-05 slot 2 had uid 250 at
+        # 1.9861 while slot 5 had it at 1.4259 -- a 0.56 spread, with slot 2
+        # scoring all three of our miners ~0.5 worse across the board. Which
+        # slot a number came from was unrecoverable from the log, so several
+        # conclusions were drawn from one validator's view of one round and
+        # contradicted by the next.
+        slots = {}
+        for v in (m.get("validator_metrics") or []):
+            s = v.get("validator_slot")
+            if s is None:
+                continue
+            slots[str(s)] = {
+                "val_loss": v.get("val_loss"),
+                "status": v.get("eval_status_label"),
+                "sample_cycle": v.get("sample_cycle"),
+                "fresh": v.get("sample_is_fresh"),
+            }
+        vals = [d["val_loss"] for d in slots.values() if d["val_loss"] is not None]
         out.append({
             "uid": m["uid"],
             "val_loss": _val_loss(m),
+            "slots": slots,
+            # Spread flags rounds where the two validators disagree; a large
+            # value means any single-slot reading is not yet trustworthy.
+            "slot_spread": (max(vals) - min(vals)) if len(vals) > 1 else None,
             "cohort": m.get("cohort_group"),
             "incentive": m.get("incentive") or 0.0,
             "repo": m.get("hf_repo_id"),
@@ -254,7 +279,18 @@ def _delta_stats(rival_path: Path, base_path: Path, ours_path: Path | None):
     from safetensors import safe_open
 
     stats = {"their_norm2": 0.0, "our_norm2": 0.0, "dot": 0.0,
-             "n_tensors": 0, "n_changed": 0, "per_layer": defaultdict(float)}
+             "n_tensors": 0, "n_changed": 0, "per_layer": defaultdict(float),
+             # Per-layer cosine, accumulated separately so a whole-model cosine
+             # near zero can be decomposed. A single scalar cannot distinguish
+             # "every layer is mildly misaligned" (a sampling effect -- same
+             # objective, noisier gradients) from "most layers agree but a few
+             # dominate and point elsewhere" (a different objective, or a
+             # different subset of experts being driven). Those imply completely
+             # different fixes, and the whole-model number has been +0.003 to
+             # +0.017 across every LR we have tried.
+             "layer_dot": defaultdict(float),
+             "layer_their2": defaultdict(float),
+             "layer_our2": defaultdict(float)}
 
     with safe_open(rival_path, framework="pt") as fr, safe_open(base_path, framework="pt") as fb:
         keys = [k for k in fr.keys() if k in set(fb.keys())]
@@ -266,16 +302,20 @@ def _delta_stats(rival_path: Path, base_path: Path, ours_path: Path | None):
             tn = float(t.pow(2).sum())
             stats["their_norm2"] += tn
             stats["n_tensors"] += 1
+            parts = k.split(".")
+            layer = next((parts[i + 1] for i, p in enumerate(parts) if p == "layers"), "other")
             if tn > 0:
                 stats["n_changed"] += 1
-                # group by transformer layer index when present
-                parts = k.split(".")
-                layer = next((parts[i + 1] for i, p in enumerate(parts) if p == "layers"), "other")
                 stats["per_layer"][layer] += tn
             if ours is not None and k in our_keys:
                 o = ours.get_tensor(k).to(torch.float64) - b
-                stats["our_norm2"] += float(o.pow(2).sum())
-                stats["dot"] += float((t * o).sum())
+                on = float(o.pow(2).sum())
+                dot = float((t * o).sum())
+                stats["our_norm2"] += on
+                stats["dot"] += dot
+                stats["layer_dot"][layer] += dot
+                stats["layer_their2"][layer] += tn
+                stats["layer_our2"][layer] += on
             del b, t
         if ours is not None:
             ours.__exit__(None, None, None)
@@ -332,6 +372,26 @@ def cmd_compare(args) -> int:
             tot = sum(s["per_layer"].values()) or 1.0
             frag = "  ".join(f"L{k}:{100*v/tot:.0f}%" for k, v in top)
             print(f"      tensors changed {s['n_changed']}/{s['n_tensors']}   {frag}")
+
+            # Per-layer cosine. A whole-model cosine near zero is ambiguous:
+            # it can mean every layer is mildly misaligned (sampling noise on a
+            # shared objective) or that a few high-magnitude layers point
+            # elsewhere while the rest agree (a genuinely different objective).
+            # Those need different fixes, so decompose rather than guess.
+            cos_by_layer = []
+            for lay, d in s["layer_dot"].items():
+                t2, o2 = s["layer_their2"].get(lay, 0.0), s["layer_our2"].get(lay, 0.0)
+                if t2 > 0 and o2 > 0:
+                    cos_by_layer.append((lay, d / ((t2 ** 0.5) * (o2 ** 0.5)), t2))
+            if cos_by_layer:
+                cos_by_layer.sort(key=lambda x: -x[2])       # by their magnitude
+                head = "  ".join(f"L{l}:{c:+.2f}" for l, c, _ in cos_by_layer[:6])
+                vals = [c for _, c, _ in cos_by_layer]
+                pos = sum(1 for v in vals if v > 0.1)
+                neg = sum(1 for v in vals if v < -0.1)
+                print(f"      per-layer cos (biggest layers): {head}")
+                print(f"      cos range {min(vals):+.2f}..{max(vals):+.2f}   "
+                      f"aligned(>0.1)={pos}  opposed(<-0.1)={neg}  of {len(vals)} layers")
 
     if our_ref is not None:
         print(f"\nour ||delta|| = {our_ref:.4f}")
