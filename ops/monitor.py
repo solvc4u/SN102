@@ -434,6 +434,48 @@ def prune_checkpoints(keep: int = CKPT_KEEP) -> list[str]:
     return removed
 
 
+LONE_MISS_SEC = int(os.environ.get("CONNITO_LONE_MISS_SEC", "3150"))   # half a cycle
+
+
+def _flag_lone_missed_commits(payload: dict) -> None:
+    """Flag a uid that skipped a commit window its peers made.
+
+    The absolute cadence thresholds (130/160 min) only fire most of a cycle
+    after the damage, and they cannot tell "the whole fleet is early in a
+    cycle" from "this one uid alone lost its place". Comparing against peers
+    separates those immediately.
+
+    uid 121 on 2026-08-08: a 429 from cycle-api at 01:43 sent its scheduler
+    straight to waiting for the NEXT Distribute, skipping MinerCommit1/2
+    entirely. It last committed at 01:11 while 250 and 178 committed at 02:56 --
+    a full cycle behind, with every process alive and every log fresh, so
+    nothing else in this monitor noticed.
+
+    That matters more now than it used to: our val_loss already beats the paid
+    miners', so the binding constraint is the 3-scores-in-5-rounds cohort gate,
+    and a skipped window is a lost round against it.
+
+    Runs as a post-pass rather than inside the per-uid loop, because the loop
+    fills payload["miners"] incrementally -- the first uid examined would have
+    had no peers to compare against.
+    """
+    miners = payload.get("miners") or {}
+    ages = {int(u): m.get("last_commit_age")
+            for u, m in miners.items()
+            if isinstance(m, dict) and m.get("last_commit_age") is not None}
+    if len(ages) < 2:
+        return
+    youngest = min(ages.values())
+    for uid, age in ages.items():
+        behind = age - youngest
+        if behind > LONE_MISS_SEC:
+            msg = (f"committed {behind/60:.0f} min after its peers "
+                   f"(this {age/60:.0f} min vs {youngest/60:.0f} min) -- SKIPPED a "
+                   f"commit window while still alive; counts against the 3-of-5 gate")
+            miners[str(uid)].setdefault("alerts", []).append(["CRIT", msg])
+            print(f"!! CRIT uid {uid}: {msg}")
+
+
 def collect(restart_ok: bool) -> dict:
     payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "miners": {}}
 
@@ -625,6 +667,9 @@ def collect(restart_ok: bool) -> dict:
             elif st.last_commit_age > COMMIT_LATE_SEC:
                 alert("WARN", f"no commit in {st.last_commit_age/60:.0f} min "
                               f"(cycle is ~105 min) -- commit window may have been skipped")
+
+            # (peer comparison runs as a post-pass below, once every uid is in
+            #  payload["miners"] -- see _flag_lone_missed_commits)
 
         # Training with an idle GPU means hung -- UNLESS the process is young.
         # Model load takes ~4 min and the poll interval is 3 min, so this check
@@ -835,6 +880,7 @@ def collect(restart_ok: bool) -> dict:
 
         payload["miners"][str(uid)] = asdict(st)
 
+    _flag_lone_missed_commits(payload)
     _save_gauge_state(gauge_state)
     return payload
 

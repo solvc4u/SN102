@@ -234,7 +234,22 @@ start_one() {
   local train_log="$LOG_DIR/uid$uid-train.log"
   local commit_log="$LOG_DIR/uid$uid-commit.log"
 
-  local train_cmd="cd $CONNITO_ROOT && ${envs[*]} $VENV/bin/python -m ops.autolr --uid $uid --path $config 2>&1 | tee -a $train_log"
+  # `touch ops/no_autolr_<uid>` to run the STOCK schedule for that uid.
+  #
+  # The stock recipe is get_cosine_schedule_with_warmup(warmup=0,
+  # total_steps=88_000) at opt.lr 1e-4. Over a ~700-step Train phase that cosine
+  # barely moves, so it is effectively a CONSTANT 1e-4 -- which is what the
+  # miners at the top of the board are running.
+  #
+  # Our phase-aware one-cycle instead anneals to a floor inside Train and then
+  # holds there for the ~43% of the cycle that is not Train. Measured on uid 250
+  # (peak 7e-5): 151 of the last 300 scheduler steps ran at ~2e-6, giving an
+  # effective average near 3.3e-5 against the field's flat 1e-4. That is a ~3x
+  # gap in effective learning, and it is why sweeping the PEAK changed so little
+  # -- half the steps sit at the floor regardless of where the peak is.
+  local autolr_flag=""
+  [[ -f "$OPS_ROOT/no_autolr_$uid" ]] && autolr_flag="--no-autolr"
+  local train_cmd="cd $CONNITO_ROOT && ${envs[*]} $VENV/bin/python -m ops.autolr --uid $uid $autolr_flag --path $config 2>&1 | tee -a $train_log"
   local commit_cmd="cd $CONNITO_ROOT && ${envs[*]} $VENV/bin/python -m ops.commit --path $config 2>&1 | tee -a $commit_log"
 
   # Stash both commands so cmd_respawn can recreate a window that tmux has

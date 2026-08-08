@@ -1,5 +1,5 @@
 {
- "peak_lr": 7e-05,
+ "peak_lr": 5e-05,
  "warmup": 0.03,
  "min_frac": 0.02
 }
